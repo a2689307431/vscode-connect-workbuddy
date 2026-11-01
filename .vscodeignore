@@ -21,6 +21,10 @@ node_modules
 .vscode
 .git
 
+# ⚠️ 下划线开头的临时/备份目录（旧 git 历史含本机路径与账号信息，绝不能进包）
+_*
+_*/**
+
 # === 必须打包（确认没被上面误伤）===
 #   extension.js
 #   package.json
