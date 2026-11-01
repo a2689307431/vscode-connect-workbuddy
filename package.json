@@ -1,0 +1,95 @@
+{
+  "name": "vscode-connect-workbuddy",
+  "displayName": "Connect WorkBuddy",
+  "description": "把 WorkBuddy 订阅额度接进 VS Code Copilot Chat 的模型下拉框（非官方）",
+  "version": "0.3.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.116.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "workbuddy",
+        "displayName": "WorkBuddy"
+      }
+    ],
+    "configuration": {
+      "title": "WorkBuddy for Copilot Chat",
+      "properties": {
+        "connect-workbuddy.proxyUrl": {
+          "type": "string",
+          "default": "",
+          "description": "留空 = 自动管理（推荐）：复用 8799 上已运行的代理，没有就自己拉起一个随机端口的，VS Code 关闭时自动退出。填了地址则完全使用指定端点，扩展不再插手。"
+        },
+        "connect-workbuddy.apiKey": {
+          "type": "string",
+          "default": "workbuddy-local-proxy",
+          "description": "占位 API Key（真正的 WorkBuddy token 由代理注入）"
+        },
+        "connect-workbuddy.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "在输出面板打印详细日志"
+        },
+        "connect-workbuddy.nodePath": {
+          "type": "string",
+          "default": "",
+          "description": "运行代理用的 node.exe 路径。留空自动探测 D:/A.Software/Node.js/node.exe 和 C:/Program Files/nodejs/node.exe，都找不到时用 VS Code 自带的 Electron（ELECTRON_RUN_AS_NODE）。"
+        },
+        "connect-workbuddy.hideLoginPrompt": {
+          "type": "boolean",
+          "default": false,
+          "description": "不再在启动时提示登录（仍然可以用命令面板的「WorkBuddy: 登录账号」）。"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "connect-workbuddy.login",
+        "title": "WorkBuddy: 登录账号",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.switchAccount",
+        "title": "WorkBuddy: 切换账号",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.refresh",
+        "title": "WorkBuddy: 刷新模型列表",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.showLogs",
+        "title": "WorkBuddy: 显示日志",
+        "category": "WorkBuddy"
+      }
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CHANGE_ME/vscode-connect-workbuddy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CHANGE_ME/vscode-connect-workbuddy/issues"
+  },
+  "homepage": "https://github.com/CHANGE_ME/vscode-connect-workbuddy#readme",
+  "keywords": [
+    "workbuddy",
+    "codebuddy",
+    "copilot",
+    "chat",
+    "llm",
+    "openai-compatible"
+  ]
+}

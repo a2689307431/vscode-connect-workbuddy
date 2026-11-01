@@ -1,0 +1,30 @@
+﻿# === 不打包的东西 ===
+
+# 开发文档（README 要打，技术文档不进包省体积）
+HANDOFF.md
+proxy/PROXY.md
+.gitignore
+
+# 测试与临时脚本
+proxy/tests/**
+_test-*.mjs
+_rename.mjs
+
+# 手动启动用的 bat（扩展会自动拉起代理，这个只在调试时方便）
+proxy/*.bat
+
+# 杂项
+*.vsix
+*.txt
+*.log
+node_modules
+.vscode
+.git
+
+# === 必须打包（确认没被上面误伤）===
+#   extension.js
+#   package.json
+#   README.md
+#   proxy/workbuddy-proxy.mjs
+#   lib/host-heartbeat-*.js   ← 核心依赖，绝不能排除
+

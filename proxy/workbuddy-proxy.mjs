@@ -1,0 +1,1305 @@
+#!/usr/bin/env node
+// WorkBuddy → OpenAI 兼容反向代理
+// 让 VS Code 里的 Continue / Cline / Roo Code 等工具直接消耗 WorkBuddy 积分。
+//
+// 启动：node workbuddy-proxy.mjs [--port 8799]
+// 客户端配置：baseURL = http://127.0.0.1:8799/v1 ，apiKey 随便填（真 token 由本进程注入）
+//
+// 依赖：dsh-connect-workbuddy 插件（复用它的凭据解密与 token 刷新）。
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+
+// ── 参数 ──────────────────────────────────────────────────────────────────
+const argv = process.argv.slice(2);
+const portIdx = argv.indexOf('--port');
+// --port 0 = 让系统分配随机端口（扩展自己拉起时用，照抄 DSH shim 的 listen(0)）
+const PORT = portIdx >= 0 ? Number(argv[portIdx + 1]) : 8799;
+
+// 扩展拉起时会注入一个进程内随机 token，防止本机其它程序直接调这个端口白嫖积分。
+// 手动双击启动时没有这个环境变量 → 跳过校验（方便 curl 调试）。
+const AUTH_TOKEN = process.env.WB_PROXY_TOKEN || '';
+
+const CN_CHAT_BASE = 'https://copilot.tencent.com';
+const GLOBAL_CHAT_BASE = 'https://www.workbuddy.ai';
+const PRODUCT = 'SaaS';
+
+// ── 定位 host-heartbeat 模块所在目录 ──────────────────────────────────────
+// 按优先级探测，找到第一个含 host-heartbeat-*.js 的目录。
+// 这样既能在这台开发机上直接跑，也能在打包分发后从扩展目录加载。
+// 需要同步升级时：把新版 host-heartbeat-*.js 覆盖到 <ext>/lib/ 即可。
+function resolveLibDir() {
+  // ⚠️ 必须用 fileURLToPath，不能用 URL.pathname ——
+  //    后者是 URL 编码的（空格变 %20、中文变 %E4%B8%AD），
+  //    路径里带空格或中文时会导致找不到模块。Windows 用户名常含中文。
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const localApp = process.env.LOCALAPPDATA || '';
+  const roamApp = process.env.APPDATA || '';
+
+  const candidates = [
+    process.env.WB_CONNECT_LIB || '',                        // ① 显式指定
+    path.join(here, '..', 'lib'),                            // ② 随扩展打包的 <ext>/lib
+    path.join(here, 'lib'),                                  // ③ 代理同目录下的 lib
+    home ? path.join(home, '.dsh', 'profiles', 'web', 'node_modules', 'dsh-connect-workbuddy', 'lib') : '',
+    localApp ? path.join(localApp, 'Programs', '@deepseek-ai', 'dsh', 'node_modules', 'dsh-connect-workbuddy', 'lib') : '',
+    roamApp ? path.join(roamApp, 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', 'dsh-connect-workbuddy', 'lib') : '',
+  ].filter(Boolean);
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      if (fs.readdirSync(dir).some((n) => /^host-heartbeat-.*\.js$/.test(n))) return dir;
+    } catch { /* 无权限等，继续找下一个 */ }
+  }
+
+  throw new Error(
+    '找不到 dsh-connect-workbuddy 模块（host-heartbeat-*.js）。\n' +
+    '已尝试：\n  ' + candidates.join('\n  ') + '\n' +
+    '请用环境变量 WB_CONNECT_LIB 指向它的 lib 目录。'
+  );
+}
+
+const LIB = resolveLibDir();
+
+// ── 加载插件模块 ──────────────────────────────────────────────────────────
+function findHeartbeatFile() {
+  const f = fs.readdirSync(LIB).find((n) => /^host-heartbeat-.*\.js$/.test(n));
+  if (!f) throw new Error(`在 ${LIB} 下找不到 host-heartbeat-*.js`);
+  return path.join(LIB, f);
+}
+
+const hbPath = findHeartbeatFile();
+const mod = await import(pathToFileURL(hbPath).href);
+const Store = mod.C;   // WorkBuddyCredentialStore
+const Client = mod.V;  // WorkBuddyUpstreamClient
+const FALLBACK_MODELS = mod.p || [];        // 国内
+const FALLBACK_MODELS_GLOBAL = mod.m || []; // 国际
+
+// ⚠️ 反风控：直接复用插件自己的请求体整形 / 指纹扰动函数。
+// 上游两个网关都有一道「通道校验」闸门：system 消息如果以未批准的身份短语开头
+// （例如 "You are an AI agent powered by DeepSeek Harness"），直接返回 11128
+// （对用户显示成「渠道校验失败」）。插件的 prepareChatBody 就是绕这道闸门的：
+//   ① stream 强制 true        ② developer → system
+//   ③ 保证首条是 system        ④ 按 CHANNEL_GATE_PHRASES 表做同义改写
+//   ⑤ 身份子句插零宽空格打断    ⑥ tool_choice 展平成字符串
+//   ⑦ 对拒绝 off 档位的模型剔掉 reasoning_effort
+// 直接用它的函数，插件一升级这边自动跟上，比自己抄一份更安全。
+const prepareChatBody = mod.rt;              // 请求体整形
+const perturbChannelFingerprints = mod.nt;   // 11128 时的零宽扰动重试
+
+if (!Store || !Client) throw new Error('插件导出结构变了，请更新本脚本');
+if (typeof prepareChatBody !== 'function') {
+  console.warn('⚠ 插件没有导出 prepareChatBody(mod.rt)，将在裸透传模式下运行（风控风险更高）');
+}
+
+const upstream = new Client();
+
+// ── 凭据存储目录 ──────────────────────────────────────────────────────────
+// 默认落在扩展自己的存储目录（由扩展通过 WB_VAULT_DIR 传入），
+// 这样完全不依赖 ~/.dsh，也不再需要 WorkBuddy 桌面客户端。
+// 不传时退回插件的默认行为（~/.dsh/workbuddy-vault），兼容手动运行。
+const VAULT_ROOT = process.env.WB_VAULT_DIR || '';
+
+function vaultDirFor(region) {
+  if (!VAULT_ROOT) return undefined; // 交给 Store 自己决定（兼容旧行为）
+  return path.join(VAULT_ROOT, region);
+}
+
+// 两个区各一份 store
+const stores = {
+  cn: new Store({ region: 'cn', refresh: (c) => upstream.refreshToken(c), vaultDir: vaultDirFor('cn') }),
+  global: new Store({ region: 'global', refresh: (c) => upstream.refreshToken(c), vaultDir: vaultDirFor('global') }),
+};
+
+if (VAULT_ROOT) {
+  for (const r of ['cn', 'global']) {
+    try { fs.mkdirSync(vaultDirFor(r), { recursive: true }); } catch { /* ignore */ }
+  }
+}
+
+// ── Token 缓存 ────────────────────────────────────────────────────────────
+const cache = { cn: null, global: null };
+
+function chatBaseOf(cred) {
+  const d = String(cred?.domain || '');
+  return d.includes('workbuddy.cn') || d.includes('tencent') ? CN_CHAT_BASE : GLOBAL_CHAT_BASE;
+}
+
+async function getCred(region = 'cn', force = false) {
+  if (!force && cache[region]) return cache[region];
+  const cred = await stores[region].resolve(); // 内部会按需刷新
+  cache[region] = cred;
+  return cred;
+}
+
+// ── 多账号池 ──────────────────────────────────────────────────────────────
+// dsh-connect-workbuddy 的 WorkBuddyCredentialStore 本身就是多账号的：
+//   accounts()          列出所有账号（桌面端登录的 + DSH vault 里登录的）
+//   credentialFor(id)   取某个账号的完整凭据
+//   needsRefresh(cred)  判断是否该刷新
+//   refreshNow(cred)    刷新并写回 vault（与插件自身行为一致）
+// 这里把「所有账号」串成池子：轮询选账号，失败自动切下一个。
+// 单账号时会退化成和以前完全一样的行为。
+const POOL_TTL_MS = 30_000;
+
+function emptyPool() {
+  return { accounts: [], loadedAt: 0, cursor: 0, tokens: new Map(), lastUsed: null };
+}
+
+const pool = { cn: emptyPool(), global: emptyPool() };
+
+async function listAccounts(region = 'cn') {
+  const p = pool[region];
+  if (p.accounts.length && Date.now() - p.loadedAt < POOL_TTL_MS) return p.accounts;
+
+  const list = await stores[region].accounts();
+  p.accounts = list;
+  p.loadedAt = Date.now();
+
+  // 账号消失时清掉它的 token 缓存
+  const ids = new Set(list.map((a) => a.id));
+  for (const id of [...p.tokens.keys()]) if (!ids.has(id)) p.tokens.delete(id);
+
+  // 轮询指针越界保护
+  if (p.cursor >= list.length) p.cursor = 0;
+  return list;
+}
+
+async function credForAccount(accountId, region = 'cn') {
+  const p = pool[region];
+  const cached = p.tokens.get(accountId);
+  if (cached && !stores[region].needsRefresh(cached)) return cached;
+
+  let cred = await stores[region].credentialFor(accountId);
+  if (!cred) return null;
+
+  if (stores[region].needsRefresh(cred)) {
+    try {
+      cred = await stores[region].refreshNow(cred);
+    } catch (e) {
+      log(`账号 ${accountId} 刷新失败：${e?.message || e}`);
+      return null;
+    }
+  }
+  p.tokens.set(accountId, cred);
+  return cred;
+}
+
+/** 用指定凭据发一次 chat 请求（body 必须是已整形的 JSON 字符串） */
+function fetchChat(cred, bodyJson) {
+  const base = chatBaseOf(cred);
+  return fetch(`${base}/v2/chat/completions`, {
+    method: 'POST',
+    headers: chatHeaders(cred),
+    body: bodyJson,
+  });
+}
+
+// ── 账号分组（模型 id 里编码账号）──────────────────────────────────────────
+// 不轮询。默认用「当前账号」——和插件完全一致，即 WorkBuddyCredentialStore.current()
+// （桌面端选中的那个，或 rotatedAccount）。
+// 想在客户端里直接指定账号时，用 /v1/models?perAccount=1 拿到的 id：
+//     "@<accountId>|<modelId>"
+// 客户端原样回传即可，代理会剥掉前缀并锁定那个账号。
+const ACCOUNT_MODEL_RE = /^@([0-9A-Za-z_-]{6,64})\|(.+)$/;
+
+function encodeAccountModel(accountId, modelId) {
+  return `@${accountId}|${modelId}`;
+}
+
+function parseAccountModel(modelId) {
+  const m = ACCOUNT_MODEL_RE.exec(String(modelId || ''));
+  return m ? { accountId: m[1], model: m[2] } : null;
+}
+
+/**
+ * 当前该用哪个账号。
+ * 优先 `store.current()`（桌面端选中 / rotatedAccount），与插件语义一致；
+ * 拿不到就退到 accounts() 里 selected 的那个，再不行取第一个。
+ */
+async function pickCurrentAccount(region, accounts) {
+  if (!accounts.length) return null;
+  try {
+    const cur = await stores[region].current();
+    if (cur && typeof mod.F === 'function') {
+      const id = mod.F(cur);
+      const hit = accounts.find((a) => a.id === id);
+      if (hit) return hit;
+    }
+  } catch { /* ignore */ }
+  return accounts.find((a) => a.selected === true) || accounts[0];
+}
+
+// ── OAuth 登录（无需 WorkBuddy 桌面客户端，跨平台）──────────────────────────
+// 照抄 dsh-connect-workbuddy 的 src/oauth.ts：
+//   ① POST {base}/v2/plugin/auth/state?platform=workbuddy  → state + authUrl
+//   ② 用户在浏览器打开 authUrl 完成登录
+//   ③ GET  {base}/v2/plugin/auth/token?state=<state>
+//        code=11217 "login ing..."  → 还没登录，继续轮询
+//        code=0/200 + accessToken   → 成功
+//   ④ GET  {base}/v2/plugin/login/account（Bearer）→ uid/nickname/enterpriseId
+//
+// 这条路完全是 HTTP，不依赖桌面客户端，所以 Linux / macOS / Windows 通用。
+const OAUTH_API_PREFIX = '/v2/plugin';
+const OAUTH_CN_BASE = 'https://www.codebuddy.cn';
+const OAUTH_GLOBAL_BASE = 'https://www.workbuddy.ai';
+const OAUTH_SESSION_TTL_MS = 10 * 60 * 1000; // state 有效期 10 分钟
+
+/** loginId -> { region, base, state, expiresAtMs, done, result?, error? } */
+const oauthSessions = new Map();
+
+function oauthBase(region, explicitBase) {
+  if (region === 'cn') return OAUTH_CN_BASE;
+  const t = typeof explicitBase === 'string' ? explicitBase.trim().replace(/\/+$/, '') : '';
+  return t || OAUTH_GLOBAL_BASE;
+}
+
+function oauthFirstString(src, keys) {
+  for (const k of keys) {
+    const v = src?.[k];
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  }
+  return '';
+}
+
+function oauthEnvelopeData(doc) {
+  const d = doc?.data;
+  return typeof d === 'object' && d !== null && !Array.isArray(d) ? d : {};
+}
+
+/** 过期时间容忍：绝对时间戳（秒/毫秒）或相对 TTL（秒）。 */
+function oauthExpiryMs(src, absoluteKeys, ttlKeys) {
+  for (const k of absoluteKeys) {
+    const v = src?.[k];
+    if (typeof v === 'number' && v > 0) return v > 0xe8d4a51000 ? v : v * 1e3;
+    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) {
+      const n = Number(v);
+      return n > 0xe8d4a51000 ? n : n * 1e3;
+    }
+  }
+  for (const k of ttlKeys) {
+    const v = src?.[k];
+    if (typeof v === 'number' && v > 0) return Date.now() + v * 1e3;
+  }
+  return undefined;
+}
+
+/** ① 申请 state，返回要打开的授权页。 */
+async function oauthStart(region = 'cn', explicitBase) {
+  const base = oauthBase(region, explicitBase);
+  const res = await fetch(`${base}${OAUTH_API_PREFIX}/auth/state?platform=workbuddy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: '{}',
+    signal: AbortSignal.timeout(30_000),
+  });
+  const doc = await res.json().catch(() => null);
+  if (!doc) throw new Error(`登录服务返回了非 JSON（HTTP ${res.status}）`);
+
+  const data = oauthEnvelopeData(doc);
+  const state = oauthFirstString(data, ['state', 'State']);
+  if (!state) throw new Error(`登录服务没有下发 state（HTTP ${res.status}, code=${doc.code ?? '?'}, msg=${doc.msg ?? ''}）`);
+
+  const authUrl =
+    oauthFirstString(data, ['authUrl', 'auth_url', 'url', 'Url']) ||
+    `${base}/login?state=${encodeURIComponent(state)}`;
+
+  const loginId = `wbo_${crypto.randomUUID().replaceAll('-', '')}`;
+  oauthSessions.set(loginId, {
+    region,
+    base,
+    state,
+    expiresAtMs: Date.now() + OAUTH_SESSION_TTL_MS,
+    done: false,
+  });
+
+  return { loginId, verificationUri: authUrl, expiresIn: Math.floor(OAUTH_SESSION_TTL_MS / 1000) };
+}
+
+/** ④ 拿账号资料，组装成 Store 能接受的凭据。 */
+async function oauthCollectAccount(session, accessToken, tokenData) {
+  const headers = { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' };
+  const domain = oauthFirstString(tokenData, ['domain', 'Domain']);
+  if (domain) headers['X-Domain'] = domain;
+
+  let profile = {};
+  try {
+    const r = await fetch(`${session.base}${OAUTH_API_PREFIX}/login/account`, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(30_000),
+    });
+    const doc = await r.json().catch(() => null);
+    if (doc) profile = oauthEnvelopeData(doc);
+  } catch { /* 资料拿不到不致命 */ }
+
+  const expiresAtMs =
+    oauthExpiryMs(tokenData, ['expiresAt', 'expires_at'], ['expiresIn', 'expires_in']) ?? 0;
+  const refreshExpiresAtMs = oauthExpiryMs(
+    tokenData,
+    ['refreshExpiresAt', 'refresh_expires_at'],
+    ['refreshExpiresIn', 'refresh_expires_in'],
+  );
+
+  const nick = oauthFirstString(profile, ['nickname', 'NickName', 'ScreenName']);
+  const uin = oauthFirstString(profile, ['uin', 'Uin']);
+  const ent = oauthFirstString(profile, ['enterpriseId', 'EnterpriseId']);
+
+  return {
+    accessToken,
+    refreshToken: oauthFirstString(tokenData, ['refreshToken', 'refresh_token', 'RefreshToken']),
+    expiresAtMs,
+    ...(refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs }),
+    domain: domain || oauthFirstString(profile, ['domain', 'Domain']),
+    uid: oauthFirstString(profile, ['uid', 'Uid', 'userId', 'UserID']),
+    ...(nick === '' ? {} : { nickname: nick }),
+    ...(uin === '' ? {} : { uin }),
+    ...(ent === '' ? {} : { enterpriseId: ent }),
+  };
+}
+
+/** ③ 轮询一次登录结果。拿到 token 就写入 vault。 */
+async function oauthPoll(loginId, region = 'cn') {
+  const s = oauthSessions.get(loginId);
+  if (!s) return { done: true, error: '登录会话不存在，请重新发起' };
+  if (s.region !== region) return { done: true, error: '登录会话属于另一个区域' };
+  if (s.done) {
+    return s.result ? { done: true, account: s.result } : { done: true, error: s.error || '登录已结束' };
+  }
+  if (Date.now() > s.expiresAtMs) {
+    s.done = true;
+    oauthSessions.delete(loginId);
+    return { done: true, error: '登录超时，请重新发起' };
+  }
+
+  let res;
+  try {
+    res = await fetch(
+      `${s.base}${OAUTH_API_PREFIX}/auth/token?state=${encodeURIComponent(s.state)}`,
+      { method: 'GET', headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(30_000) },
+    );
+  } catch {
+    return { done: false }; // 网络抖动，下次再试
+  }
+
+  const doc = await res.json().catch(() => null);
+  if (!doc) return { done: false };
+
+  const code = typeof doc.code === 'number' ? doc.code : -1;
+  if (code !== 0 && code !== 200) {
+    // 11217 = "login ing..."，正常的"还没登录"，继续等
+    if (code === 11217) return { done: false, pending: true, hint: '等待浏览器完成登录' };
+    return { done: false, pending: true, hint: `code=${code} ${doc.msg || ''}`.trim() };
+  }
+
+  const data = oauthEnvelopeData(doc);
+  const accessToken = oauthFirstString(data, ['accessToken', 'access_token', 'AccessToken']);
+  if (!accessToken) return { done: false };
+
+  s.done = true;
+  try {
+    const credential = await oauthCollectAccount(s, accessToken, data);
+    const accountId = await stores[s.region].addOAuthAccount(credential);
+    // 让账号池立刻能看到新账号
+    pool[s.region].loadedAt = 0;
+    pool[s.region].tokens.set(accountId, credential);
+    s.result = {
+      id: accountId,
+      name: credential.nickname || credential.uin || accountId,
+      domain: credential.domain,
+    };
+    log(`✓ OAuth 登录成功：${s.result.name}`);
+    oauthSessions.delete(loginId);
+    return { done: true, account: s.result };
+  } catch (e) {
+    s.error = e?.message || String(e);
+    oauthSessions.delete(loginId);
+    return { done: true, error: s.error };
+  }
+}
+
+// ── 工具 ──────────────────────────────────────────────────────────────────
+function send(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+  });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function log(...a) {
+  const t = new Date().toTimeString().slice(0, 8);
+  console.log(`[${t}]`, ...a);
+}
+
+// ── 模型别名兜底 ──────────────────────────────────────────────────────────
+// 上游对未知模型返回 {"code":11102,"msg":"model [xxx] service info not found"}，
+// 而 VS Code 扩展会把它显示成「请求体格式错误」—— 极误导。
+// 这里先按别名表纠一次，别名表没有再问上游要真实列表做模糊匹配。
+const MODEL_ALIASES = {
+  'deepseek-flash': 'deepseek-v4-flash',
+  'deepseek-pro': 'deepseek-v4-pro',
+  'deepseek-chat': 'deepseek-v4-flash',
+  'deepseek-reasoner': 'deepseek-v4-pro',
+  'deepseek-v4.1-flash': 'deepseek-v4-flash',
+  'deepseek-v4-flash-vision-exp': 'deepseek-v4-flash',
+  'deepseek-v4-flash-exp': 'deepseek-v4-flash',
+};
+
+let realModelIds = null;   // 最终可用 id 集合（按插件规则筛出来的）
+let catalogModels = null;  // 完整元数据（name/contextWindow/supportsImages/...）
+let verifiedIds = null;    // 实测 200 的 id 集合（可选，用于标注）
+
+// ↓↓↓ 以下筛选规则照抄 dsh-connect-workbuddy（host-heartbeat-*.js）↓↓↓
+//   ROUTER_MODEL_IDS   @1011  ["auto", "default-model"]  —— 上游路由器，不是真模型
+//   selectCliModels    @4691  —— 用 agents[name=cli].models 当白名单
+//   MEDIA_TAGS         @1192  —— 生图/生视频标签
+const ROUTER_MODEL_IDS = new Set(['auto', 'default-model']);
+const MEDIA_TAGS = ['text-to-image', 'image-to-image', 'text-to-video', 'image-to-video'];
+
+function isRouterModelId(id) {
+  return ROUTER_MODEL_IDS.has(id);
+}
+
+// 照抄 selectCliModels：白名单 = agents 里 name==='cli' 的 models 数组
+function selectCliModels(rawModels, agents) {
+  const byId = new Map();
+  for (const m of Array.isArray(rawModels) ? rawModels : []) {
+    if (m && typeof m === 'object' && typeof m.id === 'string') byId.set(m.id, m);
+  }
+  let cliIds;
+  for (const a of Array.isArray(agents) ? agents : []) {
+    if (a && typeof a === 'object' && a.name === 'cli' && Array.isArray(a.models)) {
+      cliIds = a.models.filter((id) => typeof id === 'string');
+      break;
+    }
+  }
+  const ids = cliIds && cliIds.length ? cliIds : [...byId.keys()];
+  return ids
+    .filter((id) => !isRouterModelId(id))
+    .map((id) => byId.get(id))
+    .filter(Boolean);
+}
+
+function knownModelIds() {
+  if (realModelIds) return realModelIds;
+  const raw = [...(FALLBACK_MODELS || []), ...(FALLBACK_MODELS_GLOBAL || [])];
+  const ids = raw.map((m) => (typeof m === 'string' ? m : (m?.id ?? m?.name ?? ''))).filter(Boolean);
+  realModelIds = new Set(ids);
+  return realModelIds;
+}
+
+// 模型目录端点（照抄插件 MODELS_CATALOG_PATH @2257）
+const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models';
+
+// 拉目录并按插件规则筛选。这是权威清单 —— 和 DSH 里看到的一致。
+async function refreshModelIds(region = 'cn') {
+  try {
+    const cred = await getCred(region);
+    const base = chatBaseOf(cred);
+    const res = await fetch(`${base}${MODELS_CATALOG_PATH}`, {
+      headers: catalogHeaders(cred), // 用 PRODUCT_UA，不是 CLIENT_UA
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) {
+      log(`模型目录 HTTP ${res.status}，退回插件内置常量`);
+      return false;
+    }
+    const j = await res.json();
+    if (j.code !== 0) {
+      log(`模型目录 code=${j.code} ${j.msg || ''}，退回插件内置常量`);
+      return false;
+    }
+    const data = j.data ?? {};
+    const selected = selectCliModels(data.models, data.agents);
+    if (selected.length) {
+      catalogModels = selected;
+      realModelIds = new Set(selected.map((m) => m.id));
+      const media = selected.filter((m) => (m.tags ?? []).some((t) => MEDIA_TAGS.includes(t)));
+      const chat = selected.filter((m) => !media.includes(m));
+      log(`已同步 ${selected.length} 个模型（chat ${chat.length} / 媒体 ${media.length}）：`);
+      log('  ' + chat.map((m) => m.id).join(', '));
+      if (media.length) log('  [媒体] ' + media.map((m) => m.id).join(', '));
+      return true;
+    }
+    log('目录解析为空，退回插件内置常量');
+  } catch (e) {
+    log(`模型目录异常：${e?.message || e}`);
+  }
+  return false;
+}
+
+// 探测哪些模型真的能调通。只探测 chat 模型（跳过生图/生视频）。
+async function verifyModels(region = 'cn') {
+  const chatModels = (catalogModels ?? []).filter(
+    (m) => !(m.tags ?? []).some((t) => MEDIA_TAGS.includes(t)),
+  );
+  if (!chatModels.length) return;
+
+  log(`探测 ${chatModels.length} 个 chat 模型可用性…`);
+  const ok = new Set();
+  const bad = [];
+
+  const probe = async (id) => {
+    try {
+      const cred = await getCred(region);
+      const base = chatBaseOf(cred);
+      // 和正式请求走同一套整形，保持一致
+      const probeSrc = JSON.stringify({
+        model: id,
+        messages: [{ role: 'user', content: '在' }],
+        stream: true,
+        max_tokens: 8,
+      });
+      const probeBody = typeof prepareChatBody === 'function' ? prepareChatBody(probeSrc, {}) : probeSrc;
+      const res = await fetch(`${base}/v2/chat/completions`, {
+        method: 'POST',
+        headers: chatHeaders(cred),
+        body: probeBody,
+        signal: AbortSignal.timeout(45_000),
+      });
+      if (res.ok) { ok.add(id); try { await res.body?.cancel(); } catch { /* ignore */ } }
+      else bad.push(id);
+    } catch {
+      bad.push(id);
+    }
+  };
+
+  for (let i = 0; i < chatModels.length; i += 5) {
+    await Promise.all(chatModels.slice(i, i + 5).map((m) => probe(m.id)));
+  }
+
+  verifiedIds = ok;
+  log(`探测完成：${ok.size}/${chatModels.length} 可用`);
+  if (bad.length) log(`不可用：${bad.join(', ')}`);
+}
+
+function resolveModel(name) {
+  if (!name) return name;
+  const known = knownModelIds();
+  if (known.has(name)) return name;                 // 本来就是真的，放行
+  const alias = MODEL_ALIASES[name];
+  if (alias && known.has(alias)) return alias;      // 别名表命中
+  // 模糊：把 "deepseek-flash" 里的 flash 拿去匹配 "deepseek-v4-flash"
+  const lower = String(name).toLowerCase();
+  const cands = [...known].filter((id) => {
+    const il = id.toLowerCase();
+    return lower.split(/[-_.]/).every((seg) => seg && il.includes(seg));
+  });
+  if (cands.length) {
+    // 取最短的（最贴近原名）
+    cands.sort((a, b) => a.length - b.length);
+    return cands[0];
+  }
+  return name; // 兜不住，原样发给上游，让它自己报错
+}
+
+// ── 上游请求 ──────────────────────────────────────────────────────────────
+
+// ↓↓↓ 以下 header 构造全部照抄 dsh-connect-workbuddy 的 host-heartbeat-*.js ↓↓↓
+// 常量来源：host-heartbeat-BtMcdOIa.js
+//   CLIENT_UA     @2308  "CLI/2.63.2 CodeBuddy/2.63.2"
+//   PRODUCT_UA    @2346  "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+//   commonHeaders @3122
+//   chatHeaders   @3148
+//   conversationHeaders @3086（对话身份三元组，缺失会 11128）
+const CLIENT_UA = 'CLI/2.63.2 CodeBuddy/2.63.2';
+const PRODUCT_UA = 'WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0';
+const APP_VERSION = PRODUCT_UA.match(/WorkBuddy\/([^\s]+)/u)?.[1] ?? '5.8.3';
+const CN_BILLING_BASE = 'https://www.codebuddy.cn';
+
+function originReferer(cred) {
+  const d = String(cred?.domain || '');
+  const isGlobal = !(d.includes('workbuddy.cn') || d.includes('tencent'));
+  return isGlobal ? (GLOBAL_CHAT_BASE) : CN_BILLING_BASE;
+}
+
+/** 每个上游请求共享的 header */
+function commonHeaders(cred) {
+  return {
+    'Accept': 'application/json, text/plain, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Origin': originReferer(cred),
+    'Referer': `${originReferer(cred)}/`,
+    'User-Agent': CLIENT_UA,
+  };
+}
+
+/**
+ * 32 位小写 hex 的 UUIDv7 —— 官方客户端请求 id 的形态（如 `01a169…`）。
+ * 照抄插件 `uuidv7()`。
+ *
+ * 插件注释：上游**不会**因为 v4 拒绝请求（带连字符的 v4 今天照样 200），
+ * 所以这是「让使用统计页看起来和官方一致」的保真修正，不是闸门。
+ * 但既然目标是「尽可能一致」，就按官方的来。
+ */
+function uuidv7(nowMs = Date.now()) {
+  const bytes = crypto.randomBytes(16);
+  for (let index = 0; index < 6; index++) {
+    bytes[index] = Math.floor(nowMs / 2 ** (8 * (5 - index))) & 255;
+  }
+  bytes[6] = (bytes[6] & 15) | 112; // version 7
+  bytes[8] = (bytes[8] & 63) | 128; // variant
+  return bytes.toString('hex');
+}
+
+/**
+ * IDE 身份头 —— 官方桌面客户端在 chat 请求里会带。
+ * 照抄插件 `ideHeaders()`：`X-IDE-Type` 保持 `CLI`（不冒充桌面端），
+ * `X-IDE-Version` 从 PRODUCT_UA 里取，避免两处版本号漂移。
+ *
+ * 插件注释：缺了这三个头，网关的「使用端」列会是**空的**，
+ * 你的请求在 WorkBuddy 使用统计页上显示成「未标识客户端」，
+ * 而官方 App 的请求显示 `WorkBuddy`。这是很明显的非官方流量特征。
+ */
+function ideHeaders() {
+  return {
+    'X-IDE-Type': 'CLI',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Version': APP_VERSION,
+  };
+}
+
+/**
+ * 对话身份三元组（官方桌面端每个请求都带；共享同一 id 会 11128）。
+ * 照抄插件 `conversationHeaders('chat', { usageIdentity: true })`：
+ * 三个值**互不相同**且**每次请求全新生成**（插件注释明确说不要跨请求复用，
+ * 那等于伪造一个自己并不拥有的会话身份）。
+ */
+function conversationHeaders() {
+  const messageId = uuidv7();
+  return {
+    'X-Conversation-ID': uuidv7(),
+    'X-Conversation-Request-ID': uuidv7(),
+    'X-Conversation-Message-ID': messageId,
+    'X-Request-ID': messageId, // 官方客户端在用 usageIdentity 时会额外带上这个
+  };
+}
+
+/** chat 请求的完整 header（照抄 chatHeaders） */
+function chatHeaders(cred) {
+  return {
+    ...commonHeaders(cred),
+    'Content-Type': 'application/json',
+    ...(cred.uid === '' || cred.uid === undefined ? { 'X-No-User-Id': '1' } : { 'X-User-Id': cred.uid }),
+    ...(cred.enterpriseId === undefined || cred.enterpriseId === ''
+      ? { 'X-No-Enterprise-Id': '1' }
+      : { 'X-Enterprise-Id': cred.enterpriseId }),
+    ...(cred.domain === '' || cred.domain === undefined ? { 'X-No-Department-Info': '1' } : { 'X-Domain': cred.domain }),
+    'X-Product': PRODUCT,
+    ...ideHeaders(),
+    'Authorization': `Bearer ${cred.accessToken}`,
+    ...conversationHeaders(),
+  };
+}
+
+/** 模型目录请求的 header（照抄 readMedia：Accept/Origin/Referer/User-Agent） */
+function catalogHeaders(cred) {
+  return {
+    'Authorization': `Bearer ${cred.accessToken}`,
+    'Accept': 'application/json',
+    'Origin': originReferer(cred),
+    'Referer': `${originReferer(cred)}/`,
+    'User-Agent': PRODUCT_UA, // 注意：目录用 PRODUCT_UA，不是 CLIENT_UA
+  };
+}
+
+async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
+  // ① 模型名纠偏（别名 / 模糊匹配），避免上游 11102
+  // ① 先剥掉账号前缀（@<accountId>|<model>），再做模型名纠偏
+  const mapped = { ...bodyObj };
+  let forcedAccountId = null;
+  {
+    const parsed = parseAccountModel(mapped.model);
+    if (parsed) {
+      forcedAccountId = parsed.accountId;
+      mapped.model = parsed.model;
+    }
+  }
+  if (mapped.model) {
+    const fixed = resolveModel(mapped.model);
+    if (fixed !== mapped.model) log(`模型名纠正：${mapped.model} → ${fixed}`);
+    mapped.model = fixed;
+  }
+  // ② ⚠️ 关键：不传 reasoning_effort 时，上游把「思考过程」直接混进 content，
+  //    reasoning_content 字段虽然在但恒为空串。显式传档位才会分离出思考。
+  //    实测（deepseek-v4.1-flash，同一道题）：
+  //      不传           → reasoning 0 字符 / content 2592
+  //      effort=high    → reasoning 1580 / content 457
+  //      effort=max     → reasoning 2213 / content 570
+  //    照抄 dsh-connect-workbuddy 的 workBuddyThinkingLevelMap()：档位取上游目录里
+  //    该模型声明的 reasoning.supportedEfforts，默认用 reasoning.defaultEffort。
+  if (mapped.reasoning_effort === undefined) {
+    const info = catalogModels?.find?.((m) => m.id === mapped.model);
+    const efforts = info?.reasoning?.supportedEfforts;
+    const dflt = info?.reasoning?.defaultEffort;
+    if (Array.isArray(efforts) && efforts.length && typeof dflt === 'string' && efforts.includes(dflt)) {
+      mapped.reasoning_effort = dflt;
+    }
+  }
+
+  // ③ 照抄插件的 prepareChatBody：反通道指纹 + 强制流式 + tool_choice 展平
+  //    （这一步是「不容易被判定为非官方客户端」的核心，别删）
+  let prepared;
+  try {
+    const src = JSON.stringify({ ...mapped, stream: true });
+    prepared = typeof prepareChatBody === 'function' ? prepareChatBody(src, {}) : src;
+  } catch (e) {
+    log('请求体整形失败，退回裸透传：', e?.message || e);
+    prepared = JSON.stringify({ ...mapped, stream: true });
+  }
+
+  // ④ 账号池：单账号时会退化成与旧版完全一致的行为
+  let accounts = [];
+  try {
+    accounts = await listAccounts(region);
+  } catch (e) {
+    log('账号列表读取失败，退回单账号模式：', e?.message || e);
+  }
+
+  if (accounts.length === 0) {
+    const cred = await getCred(region);
+    const res = await fetchChat(cred, prepared);
+    if (res.status === 401 && retryOn401) {
+      log('401 → 强制刷新 token 后重试');
+      cache[region] = null;
+      await getCred(region, true);
+      return callUpstream(bodyObj, region, false);
+    }
+    return res;
+  }
+
+  // ④ 选定账号：带前缀就锁定指定账号，否则用「当前账号」——不轮询
+  const p = pool[region];
+  let targets;
+
+  if (forcedAccountId) {
+    const hit = accounts.find((a) => a.id === forcedAccountId);
+    if (hit) {
+      targets = [hit];
+      log(`指定账号「${hit.accountName}」`);
+    } else {
+      log(`指定账号 ${forcedAccountId} 已不存在，退回当前账号`);
+      targets = accounts;
+    }
+  } else {
+    targets = accounts;
+  }
+
+  // 把「当前账号」排到最前面，其余作为失败兜底
+  const current = await pickCurrentAccount(region, accounts);
+  if (current && !forcedAccountId) {
+    targets = [current, ...accounts.filter((a) => a.id !== current.id)];
+  }
+
+  const n = targets.length;
+  let lastRes = null;
+  let lastErr = null;
+
+  for (let i = 0; i < n; i++) {
+    const acct = targets[i];
+
+    let cred;
+    try {
+      cred = await credForAccount(acct.id, region);
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+    if (!cred) {
+      if (n > 1) log(`账号「${acct.accountName}」没有可用凭据，跳过`);
+      continue;
+    }
+
+    // 单账号最多试 3 轮：① 正常 ② 401 刷 token / 4xx 用零宽扰动 ③ 兜底
+    let bodyForAttempt = prepared;
+    let perturbationTried = false;
+
+    for (let same = 0; same < 3; same++) {
+      let res;
+      try {
+        res = await fetchChat(cred, bodyForAttempt);
+      } catch (e) {
+        lastErr = e;
+        break;
+      }
+
+      if (res.ok) {
+        p.lastUsed = acct.id;
+        if (n > 1 || forcedAccountId) log(`✓ 账号「${acct.accountName}」`);
+        return res;
+      }
+
+      lastRes = res;
+
+      // 401 → 刷新这个账号的 token 再试一次
+      if (res.status === 401 && same === 0) {
+        log(`账号「${acct.accountName}」401，刷新 token 后重试`);
+        p.tokens.delete(acct.id);
+        try {
+          cred = await credForAccount(acct.id, region);
+        } catch {
+          cred = null;
+        }
+        if (cred) continue;
+        break;
+      }
+
+      // 4xx 且首轮 → 可能是 11128「通道校验」，用插件的零宽扰动再试一次
+      if (
+        !perturbationTried &&
+        (res.status === 400 || res.status === 403 || res.status === 422) &&
+        typeof perturbChannelFingerprints === 'function'
+      ) {
+        const pert = perturbChannelFingerprints(prepared, false);
+        if (pert) {
+          perturbationTried = true;
+          log(`账号「${acct.accountName}」返回 ${res.status}，疑似通道校验，改用零宽扰动重试`);
+          bodyForAttempt = pert;
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (n > 1) log(`账号「${acct.accountName}」不可用（HTTP ${lastRes?.status}），换下一个`);
+  }
+
+  if (lastRes) return lastRes;
+  throw lastErr || new Error('所有 WorkBuddy 账号都不可用');
+}
+
+// 把 SSE 聚合成一次完整响应（客户端要 stream:false 时用）
+async function aggregate(res) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let content = '';
+  let reasoning = '';
+  let id = 'wb-' + Date.now();
+  let model = 'unknown';
+  let finish = 'stop';
+  let usage = null;
+  const toolCalls = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+    for (const raw of lines) {
+      const s = raw.trim();
+      if (!s.startsWith('data:')) continue;
+      const p = s.slice(5).trim();
+      if (p === '[DONE]') continue;
+      let j;
+      try { j = JSON.parse(p); } catch { continue; }
+      if (j.id) id = j.id;
+      if (j.model) model = j.model;
+      if (j.usage) usage = j.usage;
+      const ch = j.choices?.[0];
+      if (!ch) continue;
+      if (ch.finish_reason) finish = ch.finish_reason;
+      const d = ch.delta || {};
+      if (d.content) content += d.content;
+      if (d.reasoning_content) reasoning += d.reasoning_content;
+      if (Array.isArray(d.tool_calls)) {
+        for (const tc of d.tool_calls) {
+          const i = tc.index ?? 0;
+          if (!toolCalls[i]) toolCalls[i] = { id: tc.id, type: 'function', function: { name: '', arguments: '' } };
+          if (tc.id) toolCalls[i].id = tc.id;
+          if (tc.function?.name) toolCalls[i].function.name += tc.function.name;
+          if (tc.function?.arguments) toolCalls[i].function.arguments += tc.function.arguments;
+        }
+      }
+    }
+  }
+
+  const msg = { role: 'assistant', content };
+  if (reasoning) msg.reasoning_content = reasoning;
+  if (toolCalls.length) msg.tool_calls = toolCalls.filter(Boolean);
+
+  return {
+    id,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: msg, finish_reason: finish }],
+    ...(usage ? { usage } : {}),
+  };
+}
+
+// ── 模型列表 ──────────────────────────────────────────────────────────────
+function modelList(region = 'cn') {
+  // 有目录元数据就用真实的（已按插件规则筛选）
+  if (catalogModels?.length) {
+    const data = catalogModels.map((m) => {
+      // 上游目录里同一个模型有两套上限字段：
+      //   contextWindow = { defaultLength: 300000, supportedLengths: [300000, 600000, 1000000] }
+      //   maxInputTokens / maxAllowedSize = 真实最大窗口（如 1000000）
+      // 客户端下拉框要展示"能力上限"，所以优先取最大值，而不是 defaultLength。
+      const cw = m.contextWindow;
+      const supported = Array.isArray(cw?.supportedLengths) ? cw.supportedLengths : [];
+      const ctx = Math.max(
+        0,
+        ...[m.maxInputTokens ?? 0, m.maxAllowedSize ?? 0, cw?.defaultLength ?? 0, ...supported],
+      ) || 0;
+      const isMedia = (m.tags ?? []).some((t) => MEDIA_TAGS.includes(t));
+      return {
+        id: m.id,
+        object: 'model',
+        created: Math.floor(Date.now() / 1000),
+        owned_by: 'workbuddy',
+        name: m.name ?? m.id,
+        // 非标准字段：客户端会忽略，方便调试和生成配置
+        context_length: ctx,
+        context_default: cw?.defaultLength ?? ctx,
+        context_supported: supported,
+        max_output_tokens: m.maxOutputTokens ?? null,
+        supports_images: m.supportsImages ?? false,
+        supports_tool_call: m.supportsToolCall ?? true,
+        supports_reasoning: m.supportsReasoning ?? false,
+        // 思考档位（照抄上游目录的 reasoning 块，供客户端决定传什么 effort）
+        reasoning_effort_supported: m.reasoning?.supportedEfforts ?? null,
+        reasoning_effort_default: m.reasoning?.defaultEffort ?? null,
+        can_disable_thinking: m.reasoning?.canDisableThinking === true,
+        credits: m.credits ?? null,
+        tags: m.tags ?? [],
+        is_media: isMedia,
+        verified: verifiedIds ? verifiedIds.has(m.id) : null,
+      };
+    });
+    return { object: 'list', data };
+  }
+
+  const ids = [...knownModelIds()];
+  const list = ids.length ? ids : ['deepseek-v4-flash'];
+  return {
+    object: 'list',
+    data: list.map((id) => ({
+      id,
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'workbuddy',
+    })),
+  };
+}
+
+// ── HTTP 服务 ─────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  const p = u.pathname;
+
+  if (req.method === 'OPTIONS') return send(res, 204, {});
+
+  // 鉴权（仅在 WB_PROXY_TOKEN 存在时启用）。/health 放行，方便探活。
+  if (AUTH_TOKEN && p !== '/health' && p !== '/') {
+    const presented = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || '').trim());
+    const a = Buffer.from(presented?.[1] || '');
+    const b = Buffer.from(AUTH_TOKEN);
+    const ok = a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+    if (!ok) {
+      log('✗ 401 鉴权失败', p);
+      return send(res, 401, { error: { message: 'unauthorized' } });
+    }
+  }
+
+  try {
+    // 健康检查
+    if (p === '/health' || p === '/') {
+      const actualPort = server.address()?.port ?? PORT;
+      let info = { ok: true, port: actualPort };
+      try {
+        const cred = await getCred('cn');
+        info = { ...info, region: 'cn', domain: cred.domain, signedIn: true };
+      } catch (e) {
+        info = { ...info, signedIn: false, error: String(e?.message || e) };
+      }
+      // 账号池概况
+      try {
+        const accts = await listAccounts('cn');
+        info.accounts = accts.length;
+        info.accountNames = accts.map((a) => a.accountName);
+        const used = pool.cn.lastUsed && accts.find((a) => a.id === pool.cn.lastUsed);
+        if (used) info.lastUsedAccount = used.accountName;
+      } catch { /* ignore */ }
+      return send(res, 200, info);
+    }
+
+    // 账号列表
+    if (p === '/accounts' && req.method === 'GET') {
+      const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      let list = [];
+      try {
+        list = await listAccounts(region);
+      } catch (e) {
+        return send(res, 500, { error: { message: String(e?.message || e) } });
+      }
+      const current = await pickCurrentAccount(region, list).catch(() => null);
+      return send(res, 200, {
+        region,
+        count: list.length,
+        strategy: '默认用当前账号（与插件一致）；请求里的模型 id 带 @<accountId>| 前缀可锁定账号；失败才顺延到其它账号',
+        current: current ? { id: current.id, name: current.accountName } : null,
+        lastUsed: pool[region].lastUsed,
+        accounts: list.map((a, i) => ({
+          index: i + 1,
+          id: a.id,
+          name: a.accountName,
+          domain: a.domain,
+          source: a.source,
+          desktopSelected: a.selected === true,
+          isCurrent: a.id === current?.id,
+          tokenExpiresAt: a.tokenExpiresAtMs ? new Date(a.tokenExpiresAtMs).toISOString() : null,
+          isLastUsed: a.id === pool[region].lastUsed,
+        })),
+      });
+    }
+
+    // 手动切换当前账号（内存态；不落盘，重启代理后回到桌面端选中的那个）
+    //   POST { "id": "<accountId>", "region": "cn" }  指定账号
+    //   POST { "id": "", "region": "cn" }             清除，回到默认
+    if (p === '/accounts/select' && req.method === 'POST') {
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        return send(res, 400, { error: { message: 'invalid JSON body' } });
+      }
+      const region = body.region === 'global' ? 'global' : 'cn';
+      const id = typeof body.id === 'string' ? body.id.trim() : '';
+
+      if (id === '') {
+        stores[region].setRotatedAccount(undefined);
+        const list = await listAccounts(region).catch(() => []);
+        const cur = await pickCurrentAccount(region, list).catch(() => null);
+        log('已恢复默认账号');
+        return send(res, 200, {
+          ok: true,
+          region,
+          current: cur ? { id: cur.id, name: cur.accountName } : null,
+        });
+      }
+
+      const list = await listAccounts(region).catch(() => []);
+      const hit = list.find((a) => a.id === id);
+      if (!hit) return send(res, 404, { error: { message: `account ${id} not found` } });
+
+      stores[region].setRotatedAccount(id);
+      log(`已切换到账号「${hit.accountName}」`);
+      return send(res, 200, { ok: true, region, current: { id: hit.id, name: hit.accountName } });
+    }
+
+    // ── OAuth 登录（无需 WorkBuddy 桌面客户端）────────────────────────────
+    // POST /auth/start  { region?, base? }  → { loginId, verificationUri, expiresIn }
+    // POST /auth/poll   { loginId, region? } → { done, account? | error?, pending?, hint? }
+    if (p === '/auth/start' && req.method === 'POST') {
+      let body = {};
+      try {
+        const raw = await readBody(req);
+        if (raw.trim()) body = JSON.parse(raw);
+      } catch { /* 允许空 body */ }
+      const region = body.region === 'global' ? 'global' : 'cn';
+      try {
+        const started = await oauthStart(region, body.base);
+        log(`OAuth 已发起（${region}），等待浏览器登录`);
+        return send(res, 200, { ok: true, region, ...started });
+      } catch (e) {
+        log('✗ OAuth 发起失败：', e?.message || e);
+        return send(res, 500, { error: { message: String(e?.message || e) } });
+      }
+    }
+
+    if (p === '/auth/poll' && req.method === 'POST') {
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        return send(res, 400, { error: { message: 'invalid JSON body' } });
+      }
+      const region = body.region === 'global' ? 'global' : 'cn';
+      const loginId = typeof body.loginId === 'string' ? body.loginId : '';
+      if (!loginId) return send(res, 400, { error: { message: 'missing loginId' } });
+      try {
+        const r = await oauthPoll(loginId, region);
+        return send(res, 200, r);
+      } catch (e) {
+        return send(res, 500, { error: { message: String(e?.message || e) } });
+      }
+    }
+
+    // 模型列表（客户端启动时会探测）
+    //   ?perAccount=1 → 按账号展开：同一模型 × 每个账号各一条，id 形如 @<accountId>|<model>
+    if ((p === '/v1/models' || p === '/models') && req.method === 'GET') {
+      const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      const base = modelList(region);
+
+      if (u.searchParams.get('perAccount') !== '1') return send(res, 200, base);
+
+      let accts = [];
+      try {
+        accts = await listAccounts(region);
+      } catch { /* ignore */ }
+      const current = await pickCurrentAccount(region, accts).catch(() => null);
+
+      if (accts.length <= 1) {
+        const data = base.data.map((m) => ({
+          ...m,
+          account_id: accts[0]?.id ?? null,
+          account_name: accts[0]?.accountName ?? null,
+          account_current: accts.length === 1,
+        }));
+        return send(res, 200, { ...base, data });
+      }
+
+      const data = [];
+      for (const a of accts) {
+        for (const m of base.data) {
+          data.push({
+            ...m,
+            id: encodeAccountModel(a.id, m.id),
+            base_id: m.id,
+            name: `${m.name} · ${a.accountName}`,
+            account_id: a.id,
+            account_name: a.accountName,
+            account_current: a.id === current?.id,
+          });
+        }
+      }
+      return send(res, 200, {
+        ...base,
+        data,
+        accounts: accts.map((a) => ({
+          id: a.id,
+          name: a.accountName,
+          source: a.source,
+          current: a.id === current?.id,
+        })),
+      });
+    }
+
+    // 手动重跑模型可用性探测
+    if (p === '/refresh-models' && req.method === 'POST') {
+      await refreshModelIds('cn');
+      await verifyModels('cn');
+      return send(res, 200, {
+        ok: true,
+        catalog: realModelIds ? realModelIds.size : 0,
+        verified: verifiedIds ? verifiedIds.size : 0,
+        usable: verifiedIds ? [...verifiedIds] : [],
+      });
+    }
+
+    // 对话
+    if (p === '/v1/chat/completions' || p === '/chat/completions') {
+      if (req.method !== 'POST') return send(res, 405, { error: { message: 'method not allowed' } });
+
+      let body;
+      try { body = JSON.parse(await readBody(req)); }
+      catch { return send(res, 400, { error: { message: 'invalid JSON body' } }); }
+
+      const wantStream = body.stream === true;
+      const region = body.__region === 'global' ? 'global' : 'cn';
+      delete body.__region;
+
+      const t0 = Date.now();
+      const up = await callUpstream(body, region);
+      if (!up.ok) {
+        const txt = await up.text();
+        log(`✗ 上游 ${up.status} ${((Date.now() - t0) / 1000).toFixed(1)}s — ${txt.slice(0, 200)}`);
+        return send(res, up.status, {
+          error: { message: `WorkBuddy upstream ${up.status}`, type: 'upstream_error', detail: txt.slice(0, 2000) },
+        });
+      }
+
+      if (wantStream) {
+        // 透传 SSE（上游格式已是标准 OpenAI chunk）
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          'connection': 'keep-alive',
+          'access-control-allow-origin': '*',
+        });
+        const reader = up.body.getReader();
+        let n = 0;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(Buffer.from(value));
+            n++;
+          }
+        } catch (e) {
+          log('流中断：', e?.message || e);
+        }
+        res.end();
+        log(`✓ 流式 ${body.model} ${n} chunk ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        return;
+      }
+
+      // 非流式：聚合成一个 JSON
+      const agg = await aggregate(up);
+      agg.model = agg.model || body.model;
+      send(res, 200, agg);
+      log(`✓ 非流式 ${body.model} ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return;
+    }
+
+    return send(res, 404, { error: { message: `unknown path ${p}` } });
+  } catch (e) {
+    log('✗ 异常：', e?.stack || e);
+    if (!res.headersSent) return send(res, 500, { error: { message: String(e?.message || e) } });
+    res.end();
+  }
+});
+
+server.listen(PORT, '127.0.0.1', async () => {
+  const actualPort = server.address().port;
+
+  // ⚠️ 这一行是扩展解析端口的约定格式，改动需同步 extension.js
+  console.log(`WB_PROXY_READY port=${actualPort}`);
+
+  console.log('─'.repeat(60));
+  console.log(`WorkBuddy 代理已启动  http://127.0.0.1:${actualPort}`);
+  console.log(`  模块   : ${path.basename(hbPath)}`);
+  console.log(`  鉴权   : ${AUTH_TOKEN ? '已启用（进程内随机 token）' : '未启用（手动启动模式）'}`);
+  console.log(`  端点   : POST /v1/chat/completions`);
+  console.log(`  模型   : GET /v1/models`);
+  console.log(`  健康   : GET /health`);
+  try {
+    const cred = await getCred('cn');
+    console.log(`  账号   : ${cred.domain || '?'}（token 长度 ${String(cred.accessToken).length}）`);
+    const accts = await listAccounts('cn').catch(() => []);
+    if (accts.length > 1) {
+      const cur = await pickCurrentAccount('cn', accts).catch(() => null);
+      console.log(`  账号池 : ${accts.length} 个 → ${accts.map((a) => a.accountName).join(' / ')}`);
+      console.log(`  当前   : ${cur?.accountName || '?'}（模型列表按账号分组，选带账号名的模型即锁定该账号）`);
+    }
+    await refreshModelIds('cn'); // 拉目录（权威清单）
+    await verifyModels('cn');    // 探测哪些真能用
+  } catch (e) {
+    console.log(`  ⚠ 还没有可用的 WorkBuddy 账号`);
+    console.log(`    在 VS Code 命令面板执行「WorkBuddy: 登录账号」即可`);
+    console.log(`    （内部原因：${String(e?.message || e).split('\n')[0].slice(0, 160)}）`);
+  }
+  console.log('─'.repeat(60));
+});
