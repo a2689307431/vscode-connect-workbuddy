@@ -78,12 +78,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/CHANGE_ME/vscode-connect-workbuddy.git"
+    "url": "https://github.com/a2689307431/vscode-connect-workbuddy.git"
   },
   "bugs": {
-    "url": "https://github.com/CHANGE_ME/vscode-connect-workbuddy/issues"
+    "url": "https://github.com/a2689307431/vscode-connect-workbuddy/issues"
   },
-  "homepage": "https://github.com/CHANGE_ME/vscode-connect-workbuddy#readme",
+  "homepage": "https://github.com/a2689307431/vscode-connect-workbuddy#readme",
   "keywords": [
     "workbuddy",
     "codebuddy",
