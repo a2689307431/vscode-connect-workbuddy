@@ -9,6 +9,8 @@
 装扩展 → 登录一次 → 下拉框里出现 "DeepSeek-V4.1-Flash · 我的账号" → 选中就能用
 ```
 
+> **📦 [下载最新版本](https://github.com/a2689307431/vscode-connect-workbuddy/releases)**
+
 ---
 
 ## 它能做什么
@@ -33,7 +35,8 @@
 
 ### 步骤
 
-1. 下载 `vscode-connect-workbuddy-x.y.z.vsix`
+1. 打开 **[Releases](https://github.com/a2689307431/vscode-connect-workbuddy/releases)** 页面，
+   下载最新版 `vscode-connect-workbuddy-x.y.z.vsix`
 2. 在 VS Code 里按 `Ctrl+Shift+P`（macOS 为 `Cmd+Shift+P`），输入 `Install from VSIX`，回车
 3. 选中下载的 `.vsix` 文件
 4. 再按 `Ctrl+Shift+P` → `Developer: Reload Window` 重载窗口
@@ -189,6 +192,22 @@ VS Code Copilot Chat
 - 使用非官方客户端访问服务**可能违反 WorkBuddy 的服务条款**，存在账号受限的风险
 - 请使用**你自己的**账号与订阅
 - 因使用本项目造成的任何后果由使用者自行承担
+
+---
+
+## 致谢
+
+本项目的实现参考了以下开源项目，感谢作者的工作。
+完整的版权与许可声明见 [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md)。
+
+| 项目 | 许可 | 本项目的使用方式 |
+|---|---|---|
+| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**，并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
+| `Sliverkiss/workbuddy2api` | MIT | 上游协议细节（基址选择、强制流式、CLI 形态请求头）的参考实现 |
+| `corrinehu/dsh-workbuddy-connect` | MIT | 本地代理的入站加固（回环校验、随机端口、随机 secret）与错误映射设计的参考 |
+
+其中 `lib/host-heartbeat-BtMcdOIa.js` 是**原样再分发**，
+文件头保留了原始版权与许可声明，请勿删除。
 
 ---
 
