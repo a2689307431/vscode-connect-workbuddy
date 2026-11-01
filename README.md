@@ -1,8 +1,9 @@
 # Connect WorkBuddy
 
-**把 WorkBuddy 的订阅额度，接进 VS Code 的模型下拉框。**
+**把 WorkBuddy 的模型，接进 VS Code Copilot Chat 的模型下拉框。**
 
-装好扩展、登录一次，Copilot Chat 的模型选择器里就会出现你自己的 WorkBuddy 模型。
+装好扩展、登录一次，模型选择器里就会多出 WorkBuddy 的模型，
+和你已有的 Copilot 模型放在同一个下拉框里 —— 直接切，不用换界面。
 不用起服务、不用记端口、不用填 base_url、不用手输模型名。
 
 ```
@@ -15,7 +16,9 @@
 
 ## 它能做什么
 
-- 🎯 **原生集成** —— 模型出现在 Copilot Chat 的模型下拉框里，而不是另起一个聊天面板
+- 🧩 **接进 Copilot 的整套工作流** —— 模型出现在 Copilot Chat 的模型下拉框里，
+  `@workspace`、`#file`、Agent 模式、自定义指令、MCP 工具都能照常用
+- 🔀 **一个下拉框里切换** —— 和 GPT、Claude 等 Copilot 自带模型并列，不用在两个面板之间来回切
 - 🔐 **OAuth 登录** —— 在浏览器里点几下就完成，不用手抄 token
 - 🖼️ **支持图片** —— 截图、设计稿可以直接粘贴给模型
 - 🧠 **显示思考过程** —— 推理模型的思考链会以可折叠的形式展示
@@ -25,12 +28,30 @@
 
 ---
 
+## 和官方 CodeBuddy 插件的关系
+
+腾讯官方有 [CodeBuddy 插件](https://marketplace.visualstudio.com/items?itemName=tencent-cloud.coding-copilot)，
+它功能更全（代码补全、inline edit、多文件 diff），但**和本项目占的不是同一个位置**：
+
+| | 官方 CodeBuddy 插件 | 本项目 |
+|---|---|---|
+| 界面 | 自己的侧边栏面板 | Copilot Chat |
+| 和 Copilot 自带模型混用 | 不行，要切面板 | 同一个下拉框 |
+| `@workspace` / Agent / MCP | 自己的一套 | 直接复用 Copilot 的 |
+| 代码补全 / inline edit | ✅ | ❌ |
+| 多账号分组 | — | ✅ |
+
+两边可以用同一个账号，不冲突。
+**想要代码补全和 inline edit，用官方插件；想在 Copilot 里统一聊天，用这个。**
+
+---
+
 ## 安装
 
 ### 前提
 
 - VS Code **1.116.0** 或更高
-- 已安装 **GitHub Copilot Chat** 扩展（免费版即可 —— 模型请求走的是你自己的 WorkBuddy 额度）
+- 已安装 **GitHub Copilot Chat** 扩展（免费版即可，模型请求由 WorkBuddy 侧处理）
 - 一个 **WorkBuddy / CodeBuddy** 账号
 
 ### 步骤
