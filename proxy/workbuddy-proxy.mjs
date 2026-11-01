@@ -124,9 +124,25 @@ if (VAULT_ROOT) {
 // ── Token 缓存 ────────────────────────────────────────────────────────────
 const cache = { cn: null, global: null };
 
+// ── 区域判定 ──────────────────────────────────────────────────────────────
+// ⚠️ 照抄插件 regionOf()（host-heartbeat-*.js @3137）：**只有** workbuddy.ai /
+//    codebuddy.ai 算国际，其它一律算国内。
+//
+// 早先这里的判断写反了（`includes('workbuddy.cn') || includes('tencent')`
+// 才算国内），后果很严重：国内账号的 domain 是 `www.codebuddy.cn`，既不含
+// workbuddy.cn 也不含 tencent → 被误判成国际区 → 请求发到 www.workbuddy.ai
+// → 拿回国际市场模型表（fast-model / balanced-model / gpt-5.6-sol …），
+// 这些 id 在国内根本不存在，探测全挂（0/16 可用）。
+function isGlobalDomain(domain) {
+  const d = String(domain || '').trim().toLowerCase();
+  return (
+    d === 'workbuddy.ai' || d.endsWith('.workbuddy.ai') ||
+    d === 'codebuddy.ai' || d.endsWith('.codebuddy.ai')
+  );
+}
+
 function chatBaseOf(cred) {
-  const d = String(cred?.domain || '');
-  return d.includes('workbuddy.cn') || d.includes('tencent') ? CN_CHAT_BASE : GLOBAL_CHAT_BASE;
+  return isGlobalDomain(cred?.domain) ? GLOBAL_CHAT_BASE : CN_CHAT_BASE;
 }
 
 async function getCred(region = 'cn', force = false) {
@@ -187,6 +203,62 @@ async function credForAccount(accountId, region = 'cn') {
   }
   p.tokens.set(accountId, cred);
   return cred;
+}
+
+// ── 积分余额 ──────────────────────────────────────────────────────────────
+// 上游端点：POST {billingBase}/v2/billing/meter/get-user-resource
+// 企业账号走另一条：POST {billingBase}/billing/meter/get-enterprise-user-usage
+//
+// 这两条的分支、套餐聚合、「已用 vs 剩余」的坑、月付/一次性包的过期时间，
+// 插件 WorkBuddyUpstreamClient.fetchCredits() 已经全部处理好了，
+// 直接复用 —— 插件升级时这边自动跟上，比自己抄一份安全。
+const CREDITS_TTL_MS = 60_000;
+const creditsCache = new Map(); // `${region}:${accountId}` → { at, value }
+
+function isoOrNull(ms) {
+  return typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * 读某个账号的剩余积分。带 60 秒缓存（上游按账号串行调用，聊天时不该反复打）。
+ * @param {string} accountId
+ * @param {'cn'|'global'} region
+ * @param {boolean} force 跳过缓存
+ */
+async function creditsFor(accountId, region = 'cn', force = false) {
+  const key = `${region}:${accountId}`;
+  const hit = creditsCache.get(key);
+  if (!force && hit && Date.now() - hit.at < CREDITS_TTL_MS) return hit.value;
+
+  if (typeof upstream.fetchCredits !== 'function') {
+    throw new Error('当前 dsh-connect-workbuddy 模块没有 fetchCredits()，请升级 host-heartbeat 到含积分接口的版本');
+  }
+
+  const cred = await credForAccount(accountId, region);
+  if (!cred) throw new Error(`账号 ${accountId} 的凭据不可用（token 刷新失败？）`);
+
+  const raw = await upstream.fetchCredits(cred);
+  const value = {
+    total: typeof raw?.total === 'number' ? raw.total : null,
+    expiringSoon: typeof raw?.expiringSoon === 'number' ? raw.expiringSoon : 0,
+    nearestExpiry: isoOrNull(raw?.nearestExpiryMs),
+    packages: (Array.isArray(raw?.packages) ? raw.packages : []).map((p) => ({
+      name: typeof p.packageName === 'string' ? p.packageName : '(未命名)',
+      remain: typeof p.remain === 'number' ? p.remain : null,
+      size: typeof p.size === 'number' ? p.size : null,
+      monthly: p.monthly === true,
+      refreshAt: isoOrNull(p.refreshAtMs),
+      expiresAt: isoOrNull(p.expiresAtMs),
+    })),
+    fetchedAt: new Date().toISOString(),
+  };
+  creditsCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+function clearCreditsCache(accountId, region) {
+  if (!accountId) { creditsCache.clear(); return; }
+  creditsCache.delete(`${region}:${accountId}`);
 }
 
 /** 用指定凭据发一次 chat 请求（body 必须是已整形的 JSON 字符串） */
@@ -464,8 +536,32 @@ const MODEL_ALIASES = {
   'deepseek-v4-flash-exp': 'deepseek-v4-flash',
 };
 
-let realModelIds = null;   // 最终可用 id 集合（按插件规则筛出来的）
-let catalogModels = null;  // 完整元数据（name/contextWindow/supportsImages/...）
+// 模型清单按区域分开存：两个市场的模型 id 完全不重叠，
+// 共用一份会导致「查 CN 的清单去纠 GLOBAL 的模型名」这种错误。
+const modelState = {
+  cn: { ids: null, catalog: null, verified: null },
+  global: { ids: null, catalog: null, verified: null },
+};
+
+// 下面两个保留原名（旧代码引用很多），它们始终指向「最近处理的那个区域」的
+// 数据。跨区域混用的风险已经由 refreshModelIds / verifyModels 的显式 region
+// 参数消除。
+let realModelIds = null;   // Set<id>
+let catalogModels = null;  // 完整元数据
+
+function useRegion(region = 'cn') {
+  const st = modelState[region] ?? modelState.cn;
+  realModelIds = st.ids;
+  catalogModels = st.catalog;
+  return st;
+}
+
+function saveRegion(region = 'cn') {
+  const st = modelState[region] ?? modelState.cn;
+  st.ids = realModelIds;
+  st.catalog = catalogModels;
+  return st;
+}
 let verifiedIds = null;    // 实测 200 的 id 集合（可选，用于标注）
 
 // ↓↓↓ 以下筛选规则照抄 dsh-connect-workbuddy（host-heartbeat-*.js）↓↓↓
@@ -499,12 +595,24 @@ function selectCliModels(rawModels, agents) {
     .filter(Boolean);
 }
 
-function knownModelIds() {
-  if (realModelIds) return realModelIds;
-  const raw = [...(FALLBACK_MODELS || []), ...(FALLBACK_MODELS_GLOBAL || [])];
+/**
+ * 兜底模型 id（只在目录拉不到时用）。
+ * ⚠️ 必须按区域选，不能把 CN / GLOBAL 两份合并 —— 两个市场的模型 id 完全不
+ *    重叠（国内 hy3/glm-5.3/…，国际 fast-model/gpt-5.6-sol/…），合并后会给出
+ *    一堆本区域根本不存在的 id，请求全 11102。
+ */
+function fallbackModelsFor(region = 'cn') {
+  return region === 'global' ? (FALLBACK_MODELS_GLOBAL || []) : (FALLBACK_MODELS || []);
+}
+
+function knownModelIds(region = 'cn') {
+  const st = modelState[region] ?? modelState.cn;
+  if (st.ids) return st.ids;
+  const raw = fallbackModelsFor(region);
   const ids = raw.map((m) => (typeof m === 'string' ? m : (m?.id ?? m?.name ?? ''))).filter(Boolean);
-  realModelIds = new Set(ids);
-  return realModelIds;
+  st.ids = new Set(ids);
+  realModelIds = st.ids;
+  return st.ids;
 }
 
 // 模型目录端点（照抄插件 MODELS_CATALOG_PATH @2257）
@@ -520,27 +628,31 @@ async function refreshModelIds(region = 'cn') {
       signal: AbortSignal.timeout(20_000),
     });
     if (!res.ok) {
-      log(`模型目录 HTTP ${res.status}，退回插件内置常量`);
+      log(`模型目录 HTTP ${res.status}，退回该区域内置常量`);
       return false;
     }
     const j = await res.json();
     if (j.code !== 0) {
-      log(`模型目录 code=${j.code} ${j.msg || ''}，退回插件内置常量`);
+      log(`模型目录 code=${j.code} ${j.msg || ''}，退回该区域内置常量`);
       return false;
     }
     const data = j.data ?? {};
     const selected = selectCliModels(data.models, data.agents);
     if (selected.length) {
-      catalogModels = selected;
-      realModelIds = new Set(selected.map((m) => m.id));
+      const st = modelState[region] ?? modelState.cn;
+      st.catalog = selected;
+      st.ids = new Set(selected.map((m) => m.id));
+      // 同步「最近区域」别名，兼容旧引用
+      catalogModels = st.catalog;
+      realModelIds = st.ids;
       const media = selected.filter((m) => (m.tags ?? []).some((t) => MEDIA_TAGS.includes(t)));
       const chat = selected.filter((m) => !media.includes(m));
-      log(`已同步 ${selected.length} 个模型（chat ${chat.length} / 媒体 ${media.length}）：`);
+      log(`[${region}] 已同步 ${selected.length} 个模型（chat ${chat.length} / 媒体 ${media.length}）：`);
       log('  ' + chat.map((m) => m.id).join(', '));
       if (media.length) log('  [媒体] ' + media.map((m) => m.id).join(', '));
       return true;
     }
-    log('目录解析为空，退回插件内置常量');
+    log('目录解析为空，退回该区域内置常量');
   } catch (e) {
     log(`模型目录异常：${e?.message || e}`);
   }
@@ -549,7 +661,8 @@ async function refreshModelIds(region = 'cn') {
 
 // 探测哪些模型真的能调通。只探测 chat 模型（跳过生图/生视频）。
 async function verifyModels(region = 'cn') {
-  const chatModels = (catalogModels ?? []).filter(
+  const catalog = modelState[region]?.catalog ?? null;
+  const chatModels = (catalog ?? []).filter(
     (m) => !(m.tags ?? []).some((t) => MEDIA_TAGS.includes(t)),
   );
   if (!chatModels.length) return;
@@ -587,14 +700,16 @@ async function verifyModels(region = 'cn') {
     await Promise.all(chatModels.slice(i, i + 5).map((m) => probe(m.id)));
   }
 
+  const st = modelState[region] ?? modelState.cn;
+  st.verified = ok;
   verifiedIds = ok;
-  log(`探测完成：${ok.size}/${chatModels.length} 可用`);
-  if (bad.length) log(`不可用：${bad.join(', ')}`);
+  log(`[${region}] 探测完成：${ok.size}/${chatModels.length} 可用`);
+  if (bad.length) log(`[${region}] 不可用：${bad.join(', ')}`);
 }
 
-function resolveModel(name) {
+function resolveModel(name, region = 'cn') {
   if (!name) return name;
-  const known = knownModelIds();
+  const known = knownModelIds(region);
   if (known.has(name)) return name;                 // 本来就是真的，放行
   const alias = MODEL_ALIASES[name];
   if (alias && known.has(alias)) return alias;      // 别名表命中
@@ -627,9 +742,7 @@ const APP_VERSION = PRODUCT_UA.match(/WorkBuddy\/([^\s]+)/u)?.[1] ?? '5.8.3';
 const CN_BILLING_BASE = 'https://www.codebuddy.cn';
 
 function originReferer(cred) {
-  const d = String(cred?.domain || '');
-  const isGlobal = !(d.includes('workbuddy.cn') || d.includes('tencent'));
-  return isGlobal ? (GLOBAL_CHAT_BASE) : CN_BILLING_BASE;
+  return isGlobalDomain(cred?.domain) ? GLOBAL_CHAT_BASE : CN_BILLING_BASE;
 }
 
 /** 每个上游请求共享的 header */
@@ -735,7 +848,7 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
     }
   }
   if (mapped.model) {
-    const fixed = resolveModel(mapped.model);
+    const fixed = resolveModel(mapped.model, region);
     if (fixed !== mapped.model) log(`模型名纠正：${mapped.model} → ${fixed}`);
     mapped.model = fixed;
   }
@@ -748,7 +861,7 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
   //    照抄 dsh-connect-workbuddy 的 workBuddyThinkingLevelMap()：档位取上游目录里
   //    该模型声明的 reasoning.supportedEfforts，默认用 reasoning.defaultEffort。
   if (mapped.reasoning_effort === undefined) {
-    const info = catalogModels?.find?.((m) => m.id === mapped.model);
+    const info = modelState[region]?.catalog?.find?.((m) => m.id === mapped.model);
     const efforts = info?.reasoning?.supportedEfforts;
     const dflt = info?.reasoning?.defaultEffort;
     if (Array.isArray(efforts) && efforts.length && typeof dflt === 'string' && efforts.includes(dflt)) {
@@ -950,9 +1063,10 @@ async function aggregate(res) {
 
 // ── 模型列表 ──────────────────────────────────────────────────────────────
 function modelList(region = 'cn') {
+  const catalog = modelState[region]?.catalog ?? null;
   // 有目录元数据就用真实的（已按插件规则筛选）
-  if (catalogModels?.length) {
-    const data = catalogModels.map((m) => {
+  if (catalog?.length) {
+    const data = catalog.map((m) => {
       // 上游目录里同一个模型有两套上限字段：
       //   contextWindow = { defaultLength: 300000, supportedLengths: [300000, 600000, 1000000] }
       //   maxInputTokens / maxAllowedSize = 真实最大窗口（如 1000000）
@@ -985,13 +1099,15 @@ function modelList(region = 'cn') {
         credits: m.credits ?? null,
         tags: m.tags ?? [],
         is_media: isMedia,
-        verified: verifiedIds ? verifiedIds.has(m.id) : null,
+        verified: modelState[region]?.verified
+          ? modelState[region].verified.has(m.id)
+          : null,
       };
     });
     return { object: 'list', data };
   }
 
-  const ids = [...knownModelIds()];
+  const ids = [...knownModelIds(region)];
   const list = ids.length ? ids : ['deepseek-v4-flash'];
   return {
     object: 'list',
@@ -1046,8 +1162,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 账号列表
+    //   ?credits=1  顺手把每个账号的剩余积分一起带上（并行请求，单个失败不影响其它）
     if (p === '/accounts' && req.method === 'GET') {
       const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      const withCredits = u.searchParams.get('credits') === '1';
       let list = [];
       try {
         list = await listAccounts(region);
@@ -1055,24 +1173,74 @@ const server = http.createServer(async (req, res) => {
         return send(res, 500, { error: { message: String(e?.message || e) } });
       }
       const current = await pickCurrentAccount(region, list).catch(() => null);
+
+      // 积分是「锦上添花」：任何账号读失败都只记 null，绝不让 /accounts 整个 500
+      const creditMap = new Map();
+      if (withCredits && list.length) {
+        const results = await Promise.allSettled(
+          list.map((a) => creditsFor(a.id, region))
+        );
+        results.forEach((r, i) => {
+          if (r.status === 'fulfilled') creditMap.set(list[i].id, r.value);
+          else log(`积分读取失败（${list[i].accountName}）：${r.reason?.message || r.reason}`);
+        });
+      }
+
       return send(res, 200, {
         region,
         count: list.length,
         strategy: '默认用当前账号（与插件一致）；请求里的模型 id 带 @<accountId>| 前缀可锁定账号；失败才顺延到其它账号',
         current: current ? { id: current.id, name: current.accountName } : null,
         lastUsed: pool[region].lastUsed,
-        accounts: list.map((a, i) => ({
-          index: i + 1,
-          id: a.id,
-          name: a.accountName,
-          domain: a.domain,
-          source: a.source,
-          desktopSelected: a.selected === true,
-          isCurrent: a.id === current?.id,
-          tokenExpiresAt: a.tokenExpiresAtMs ? new Date(a.tokenExpiresAtMs).toISOString() : null,
-          isLastUsed: a.id === pool[region].lastUsed,
-        })),
+        accounts: list.map((a, i) => {
+          const c = creditMap.get(a.id);
+          return {
+            index: i + 1,
+            id: a.id,
+            name: a.accountName,
+            domain: a.domain,
+            source: a.source,
+            desktopSelected: a.selected === true,
+            isCurrent: a.id === current?.id,
+            tokenExpiresAt: a.tokenExpiresAtMs ? new Date(a.tokenExpiresAtMs).toISOString() : null,
+            isLastUsed: a.id === pool[region].lastUsed,
+            ...(withCredits ? { credits: c ? c.total : null, creditError: c ? null : '读取失败' } : {}),
+          };
+        }),
       });
+    }
+
+    // 查某个账号的剩余积分（含套餐明细）
+    //   GET /credits?id=<accountId>&region=cn&force=1
+    //   不传 id 时用「当前账号」
+    if (p === '/credits' && req.method === 'GET') {
+      const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      const force = u.searchParams.get('force') === '1';
+      let accountId = (u.searchParams.get('id') || '').trim();
+      let accountName = null;
+
+      try {
+        const list = await listAccounts(region);
+        if (!list.length) {
+          return send(res, 404, { error: { message: '还没有任何账号，请先登录' } });
+        }
+        if (accountId) {
+          const hit = list.find((a) => a.id === accountId);
+          if (!hit) return send(res, 404, { error: { message: `account ${accountId} not found` } });
+          accountName = hit.accountName;
+        } else {
+          const cur = await pickCurrentAccount(region, list);
+          if (!cur) return send(res, 404, { error: { message: '没有可用的当前账号' } });
+          accountId = cur.id;
+          accountName = cur.accountName;
+        }
+
+        const credits = await creditsFor(accountId, region, force);
+        return send(res, 200, { ok: true, region, accountId, accountName, ...credits });
+      } catch (e) {
+        log('GET /credits 失败：', e?.message || e);
+        return send(res, 502, { error: { message: String(e?.message || e) } });
+      }
     }
 
     // 手动切换当前账号（内存态；不落盘，重启代理后回到桌面端选中的那个）
@@ -1105,6 +1273,7 @@ const server = http.createServer(async (req, res) => {
       if (!hit) return send(res, 404, { error: { message: `account ${id} not found` } });
 
       stores[region].setRotatedAccount(id);
+      clearCreditsCache(id, region);
       log(`已切换到账号「${hit.accountName}」`);
       return send(res, 200, { ok: true, region, current: { id: hit.id, name: hit.accountName } });
     }
@@ -1164,6 +1333,7 @@ const server = http.createServer(async (req, res) => {
       if (accts.length <= 1) {
         const data = base.data.map((m) => ({
           ...m,
+          base_name: m.name,
           account_id: accts[0]?.id ?? null,
           account_name: accts[0]?.accountName ?? null,
           account_current: accts.length === 1,
@@ -1178,6 +1348,9 @@ const server = http.createServer(async (req, res) => {
             ...m,
             id: encodeAccountModel(a.id, m.id),
             base_id: m.id,
+            // base_name = 不带账号后缀的干净模型名。
+            // 客户端按账号分组时必须用它，否则会出现「模型 · 账号 · 账号」双写。
+            base_name: m.name,
             name: `${m.name} · ${a.accountName}`,
             account_id: a.id,
             account_name: a.accountName,
@@ -1199,13 +1372,16 @@ const server = http.createServer(async (req, res) => {
 
     // 手动重跑模型可用性探测
     if (p === '/refresh-models' && req.method === 'POST') {
-      await refreshModelIds('cn');
-      await verifyModels('cn');
+      const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      await refreshModelIds(region);
+      await verifyModels(region);
+      const st = modelState[region] ?? modelState.cn;
       return send(res, 200, {
         ok: true,
-        catalog: realModelIds ? realModelIds.size : 0,
-        verified: verifiedIds ? verifiedIds.size : 0,
-        usable: verifiedIds ? [...verifiedIds] : [],
+        region,
+        catalog: st.ids ? st.ids.size : 0,
+        verified: st.verified ? st.verified.size : 0,
+        usable: st.verified ? [...st.verified] : [],
       });
     }
 
@@ -1287,15 +1463,17 @@ server.listen(PORT, '127.0.0.1', async () => {
   console.log(`  健康   : GET /health`);
   try {
     const cred = await getCred('cn');
-    console.log(`  账号   : ${cred.domain || '?'}（token 长度 ${String(cred.accessToken).length}）`);
+    // 区域以凭据里的 domain 为准（国内账号的 domain 是 www.codebuddy.cn）
+    const region = isGlobalDomain(cred.domain) ? 'global' : 'cn';
+    console.log(`  账号   : ${cred.domain || '?'}（token 长度 ${String(cred.accessToken).length}，区域 ${region}）`);
     const accts = await listAccounts('cn').catch(() => []);
     if (accts.length > 1) {
       const cur = await pickCurrentAccount('cn', accts).catch(() => null);
       console.log(`  账号池 : ${accts.length} 个 → ${accts.map((a) => a.accountName).join(' / ')}`);
       console.log(`  当前   : ${cur?.accountName || '?'}（模型列表按账号分组，选带账号名的模型即锁定该账号）`);
     }
-    await refreshModelIds('cn'); // 拉目录（权威清单）
-    await verifyModels('cn');    // 探测哪些真能用
+    await refreshModelIds(region); // 拉目录（权威清单）
+    await verifyModels(region);    // 探测哪些真能用
   } catch (e) {
     console.log(`  ⚠ 还没有可用的 WorkBuddy 账号`);
     console.log(`    在 VS Code 命令面板执行「WorkBuddy: 登录账号」即可`);

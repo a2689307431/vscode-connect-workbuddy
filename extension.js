@@ -201,6 +201,376 @@ async function fetchAccounts() {
   return res.json();
 }
 
+/** 查剩余积分。不传 accountId 时用代理侧的「当前账号」。 */
+async function fetchCredits(accountId, force = false) {
+  const q = new URLSearchParams();
+  if (accountId) q.set('id', accountId);
+  if (force) q.set('force', '1');
+  const res = await fetch(baseUrl() + '/credits?' + q.toString(), {
+    headers: { authorization: 'Bearer ' + getApiKey() },
+    signal: AbortSignal.timeout(20_000),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j?.error?.message || `HTTP ${res.status}`);
+  return j;
+}
+
+/** 账号列表 + 每个账号的剩余积分（代理侧并行查询）。 */
+async function fetchAccountsWithCredits() {
+  const res = await fetch(baseUrl() + '/accounts?credits=1', {
+    headers: { authorization: 'Bearer ' + getApiKey() },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j?.error?.message || `GET /accounts 返回 HTTP ${res.status}`);
+  return j;
+}
+
+// ── 状态栏积分 ────────────────────────────────────────────────────
+// 状态栏跟随「你实际在用哪个账号」：
+//   · 模型 id 形如 `@<accountId>|<model>`（代理 /v1/models?perAccount=1 生成），
+//     每次发请求时解析出账号 → 状态栏立刻切到那个账号的余额
+//   · 还没发过请求时，退回代理侧的「当前账号」
+// 上游按账号串行查询，所以别太勤：定时刷新 5 分钟一次，
+// 切账号 / 换模型 / 登录成功 / 手动刷新时立刻更新。
+let statusBar = null;
+let creditsTimer = null;
+let creditsInFlight = null;
+let creditsInFlightFor; // 上面那个请求是给哪个账号发的（null = 代理当前账号）
+
+// 状态栏正在跟踪的账号。null = 用代理侧的「当前账号」
+let trackedAccountId = null;
+let trackedAccountName = null;
+
+/** 解析 `@<accountId>|<modelId>`；不是这个格式返回 null（裸模型名）。 */
+const ACCOUNT_MODEL_RE = /^@([0-9A-Za-z_-]{6,64})\|(.+)$/;
+function parseAccountModelId(id) {
+  const m = ACCOUNT_MODEL_RE.exec(String(id || ''));
+  return m ? { accountId: m[1], model: m[2] } : null;
+}
+
+/** 刷新间隔（秒 → 毫秒），从设置读，最小 60 秒 */
+function creditsRefreshMs() {
+  const s = Number(vscode.workspace.getConfiguration(SECTION).get('creditsRefreshSeconds'));
+  return (Number.isFinite(s) && s >= 60 ? s : 300) * 1000;
+}
+
+/** 1234.56 → "1,235"；1.2 → "1.2"。整数就省略小数。 */
+function formatCredits(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  const rounded = Math.round(n * 100) / 100;
+  return rounded.toLocaleString('en-US', {
+    maximumFractionDigits: Number.isInteger(rounded) ? 0 : 2,
+  });
+}
+
+/**
+ * 状态栏里的账号名要短。
+ * 手机号会脱敏成 `191****8553`（本来就短），昵称则截到 8 个字。
+ */
+function shortenAccountName(name) {
+  const s = String(name || '').trim();
+  if (!s) return '';
+  return s.length > 10 ? s.slice(0, 9) + '…' : s;
+}
+
+function setStatusBar(state, text, tooltip, command = 'connect-workbuddy.showCredits') {
+  if (!statusBar) return;
+  // 用户可以在设置里关掉状态栏
+  if (vscode.workspace.getConfiguration(SECTION).get('showCreditsInStatusBar') === false) {
+    statusBar.hide();
+    return;
+  }
+  statusBar.text = text;
+  statusBar.tooltip = tooltip;
+  statusBar.command = command;
+  statusBar.show();
+  switch (state) {
+    case 'ok': statusBar.backgroundColor = undefined; break;
+    case 'warn': statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground'); break;
+    case 'error': statusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground'); break;
+    default: statusBar.backgroundColor = undefined;
+  }
+}
+
+/** 刷新状态栏上的积分。失败也不弹窗，只把状态栏变红。 */
+function refreshCreditsStatus({ quiet = false, force = false } = {}) {
+  // 同一个账号正在查就直接复用；换账号时必须重新发起
+  if (creditsInFlight && creditsInFlightFor === (trackedAccountId || null)) {
+    return creditsInFlight;
+  }
+  const wantAccount = trackedAccountId || null;
+  creditsInFlightFor = wantAccount;
+  const task = (async () => {
+    try {
+      // 跟随正在使用的账号；没跟踪就交给代理用「当前账号」
+      const c = await fetchCredits(wantAccount || undefined, force);
+      // 请求期间用户又切了账号 → 这次结果已过时，丢掉
+      if ((trackedAccountId || null) !== wantAccount) return null;
+      const num = formatCredits(c.total);
+      if (num === null) {
+        setStatusBar('error', '$(warning) WorkBuddy 积分 ?', '没读到余额（点这里看详情）');
+        return null;
+      }
+      // 服务端认出的账号名以它为准（切账号后名字也会更新）
+      if (c.accountId) {
+        trackedAccountId = c.accountId;
+        trackedAccountName = c.accountName || null;
+      }
+      const low = c.total <= 0;
+      const soon = typeof c.expiringSoon === 'number' && c.expiringSoon > 0;
+      const label = c.accountName || c.accountId || '当前账号';
+      const tip = new vscode.MarkdownString();
+      tip.appendMarkdown(`**WorkBuddy 剩余积分**：${num}\n\n`);
+      tip.appendMarkdown(`账号：\`${label}\`\n\n`);
+      if (c.nearestExpiry) {
+        tip.appendMarkdown(`最近到期：${new Date(c.nearestExpiry).toLocaleString()}\n\n`);
+      }
+      if (soon) tip.appendMarkdown(`⚠️ 其中 ${formatCredits(c.expiringSoon)} 将在 30 天内过期\n\n`);
+      if (wantAccount) {
+        tip.appendMarkdown('_这是你在模型下拉框里所选账号的余额 · 点击查看明细_');
+      } else {
+        tip.appendMarkdown('_点击查看积分明细_');
+      }
+      // 带账号名，否则两个账号余额相近时根本分不清现在显示的是谁
+      const shortName = shortenAccountName(label);
+      const text = wantAccount && shortName
+        ? `$(credit-card) ${num} · ${shortName}`
+        : `$(credit-card) ${num}`;
+      setStatusBar(low ? 'warn' : 'ok', text, tip);
+      if (!quiet) log(`积分刷新：${num}（${label}）`);
+      return c;
+    } catch (e) {
+      const msg = String(e?.message || e);
+      // 没登录 / 代理没起来：状态栏直接藏起来，比挂个红叉友好
+      if (/还没有任何账号|没有可用的当前账号|unauthorized|ECONNREFUSED|fetch failed/i.test(msg)) {
+        if (statusBar) statusBar.hide();
+        if (!quiet) log('积分不可用（正常，通常是还没登录）：' + msg);
+        return null;
+      }
+      setStatusBar('error', '$(warning) WorkBuddy 积分 ?', '读不到积分：' + msg);
+      if (!quiet) log('积分刷新失败：' + msg);
+      return null;
+    } finally {
+      if (creditsInFlightFor === wantAccount) {
+        creditsInFlight = null;
+        creditsInFlightFor = undefined;
+      }
+    }
+  })();
+  creditsInFlight = task;
+  return task;
+}
+
+/**
+ * 状态栏切到某个账号（用户选了一个带账号前缀的模型时调用）。
+ * 已经是这个账号就不重复请求；换账号时强制跳过代理侧缓存，保证数字是新的。
+ */
+function trackAccount(accountId, { force = false } = {}) {
+  const changed = accountId !== trackedAccountId;
+  if (!force && !changed) return Promise.resolve(null);
+  trackedAccountId = accountId || null;
+  trackedAccountName = null;
+  // 换账号 = 必须绕过缓存，否则会显示上一个账号的余额
+  return refreshCreditsStatus({ force: changed || force });
+}
+
+// ── 账号分组（模型下拉框里每个账号一个分组）──────────────────────────
+// VS Code 的模型下拉框只能按 `chatLanguageModels.json` 里的
+// { name, vendor } 条目分组（源码里 _resolveAllLanguageModels 会为每个条目
+// 单独调一次 provider，并把条目的其它字段放进 options.configuration）。
+// 所以「每个账号一组」只能靠往那个文件里写条目，扩展没法凭空创建分组。
+//
+// 文件位置（VS Code 内部叫 currentProfile.languageModelsResource）：
+//   Windows  %APPDATA%\Code\User\chatLanguageModels.json
+//   macOS    ~/Library/Application Support/Code/User/chatLanguageModels.json
+//   Linux    ~/.config/Code/User/chatLanguageModels.json
+// 也支持 --user-data-dir 指定的目录，所以优先用 context.globalStorageUri 反推。
+const GROUP_PREFIX = 'WorkBuddy';
+
+function modelsConfigPath(context) {
+  // globalStorageUri: <userDataDir>/globalStorage/<extId>
+  //   → <userDataDir>/chatLanguageModels.json
+  try {
+    const gs = context.globalStorageUri?.fsPath;
+    if (gs) {
+      const userDir = path.dirname(path.dirname(gs));
+      return path.join(userDir, 'chatLanguageModels.json');
+    }
+  } catch { /* 落到下面的兜底 */ }
+
+  const appData = process.env.APPDATA
+    || (process.env.HOME ? path.join(process.env.HOME, '.config') : '');
+  const base = process.platform === 'darwin'
+    ? (process.env.HOME ? path.join(process.env.HOME, 'Library', 'Application Support') : '')
+    : appData;
+  return base ? path.join(base, 'Code', 'User', 'chatLanguageModels.json') : '';
+}
+
+/** 读 chatLanguageModels.json；文件不存在/坏了都返回空数组。 */
+function readModelsConfig(file) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const j = JSON.parse(raw);
+    return Array.isArray(j) ? j : [];
+  } catch (e) {
+    if (e?.code !== 'ENOENT') log('读 chatLanguageModels.json 失败：' + (e?.message || e));
+    return [];
+  }
+}
+
+/** 写回（先备份一次，原子写）。 */
+function writeModelsConfig(file, list) {
+  try {
+    if (fs.existsSync(file)) {
+      fs.copyFileSync(file, file + '.workbuddy-bak');
+    }
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(list, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (e) {
+    log('写 chatLanguageModels.json 失败：' + (e?.message || e));
+    throw e;
+  }
+}
+
+// 组名里不能有奇怪字符，且要能稳定地反查回账号 id
+function groupNameFor(account) {
+  return `${GROUP_PREFIX} · ${account.name}`;
+}
+
+function isOurGroup(g) {
+  return g && g.vendor === VENDOR && typeof g.name === 'string' && g.name.startsWith(GROUP_PREFIX);
+}
+
+// 「配置文件里是否已经有我们的账号分组」被 provider 每次调用时查询，
+// 但 VS Code 一次解析会对每个组各调一次，所以加个短缓存（文件改动靠 mtime 感知）。
+let groupsProbe = { file: '', mtimeMs: 0, has: false, at: 0 };
+
+/** 配置文件里是否存在 vendor=workbuddy 且名字以 "WorkBuddy" 开头的条目。 */
+function hasAccountGroups(context) {
+  const file = modelsConfigPath(context);
+  if (!file) return false;
+
+  let mtimeMs = 0;
+  try { mtimeMs = fs.statSync(file).mtimeMs; } catch { return false; }
+
+  // mtime 没变就直接用上次结论
+  if (groupsProbe.file === file && groupsProbe.mtimeMs === mtimeMs) return groupsProbe.has;
+
+  const has = readModelsConfig(file).some(isOurGroup);
+  groupsProbe = { file, mtimeMs, has, at: Date.now() };
+  return has;
+}
+
+/**
+ * 按当前账号列表同步分组条目。
+ * @returns {{added:string[], removed:string[], kept:string[]}}
+ */
+function syncAccountGroups(context, accounts) {
+  const file = modelsConfigPath(context);
+  if (!file) throw new Error('找不到 chatLanguageModels.json 的位置');
+
+  const list = readModelsConfig(file);
+  const others = list.filter((g) => !isOurGroup(g));
+
+  // 保留用户自己建的同名组（非本扩展格式的），按 (vendor:name) 去重
+  const want = [];
+  const seenName = new Set(others.map((g) => `${g.vendor}:${g.name}`));
+  for (const a of accounts) {
+    const name = groupNameFor(a);
+    if (seenName.has(`${VENDOR}:${name}`)) continue;
+    seenName.add(`${VENDOR}:${name}`);
+    want.push({
+      name,
+      vendor: VENDOR,
+      workbuddyAccount: a.id,
+    });
+  }
+
+  const before = new Set(list.filter(isOurGroup).map((g) => g.name));
+  const after = new Set(want.map((g) => g.name));
+  const added = [...after].filter((n) => !before.has(n));
+  const removed = [...before].filter((n) => !after.has(n));
+  const kept = [...after].filter((n) => before.has(n));
+
+  // 顺序保持：别人的组在前，我们的组在后
+  writeModelsConfig(file, [...others, ...want]);
+  return { added, removed, kept, file };
+}
+
+/**
+ * 按当前账号同步分组，不弹窗（登录成功 / 激活时调用）。
+ * @returns {Promise<{added:string[], removed:string[], kept:string[], file:string}|null>}
+ */
+async function autoSyncGroups(context, { silent = true } = {}) {
+  let accounts = [];
+  try {
+    accounts = (await fetchAccounts()).accounts || [];
+  } catch (e) {
+    if (!silent) throw e;
+    log('分组同步跳过（读不到账号）：' + (e?.message || e));
+    return null;
+  }
+  if (!accounts.length) return null;
+
+  let result;
+  try {
+    result = syncAccountGroups(context, accounts);
+  } catch (e) {
+    log('分组同步失败：' + (e?.message || e));
+    return null;
+  }
+
+  if (result.added.length || result.removed.length) {
+    output.appendLine(
+      `分组已同步：+${result.added.length} -${result.removed.length}（共 ${accounts.length} 组）`
+    );
+    for (const n of result.added) output.appendLine('  + ' + n);
+    for (const n of result.removed) output.appendLine('  - ' + n);
+  }
+  return result;
+}
+
+/**
+ * 把一次积分响应整理成弹窗文本。
+ * 返回用户点了哪个按钮（'刷新' / '查看其它账号' / undefined）。
+ */
+async function showCreditsModal(c, allowSwitch) {
+  const total = formatCredits(c.total) ?? '—';
+  const lines = [`账号：${c.accountName || c.accountId || '当前账号'}`, `剩余合计：${total} 积分`];
+
+  if (c.nearestExpiry) lines.push(`最近到期：${new Date(c.nearestExpiry).toLocaleString()}`);
+  if (c.expiringSoon > 0) {
+    lines.push(`注意：其中 ${formatCredits(c.expiringSoon)} 将在 30 天内过期`);
+  }
+
+  const pkgs = Array.isArray(c.packages) ? c.packages : [];
+  if (pkgs.length) {
+    lines.push('', '积分包明细：');
+    for (const p of pkgs) {
+      const remain = formatCredits(p.remain) ?? '?';
+      const size = formatCredits(p.size);
+      const when = p.monthly
+        ? (p.refreshAt ? `每月 ${new Date(p.refreshAt).toLocaleDateString()} 重置` : '每月重置')
+        : (p.expiresAt ? `${new Date(p.expiresAt).toLocaleDateString()} 到期` : '');
+      lines.push(`  · ${p.name}：${remain}${size ? ` / ${size}` : ''}${when ? `，${when}` : ''}`);
+    }
+  } else {
+    lines.push('', '没有查到积分包（企业账号，或余额已用尽）。');
+  }
+
+  const buttons = ['刷新'];
+  if (allowSwitch) buttons.push('查看其它账号');
+
+  return vscode.window.showInformationMessage(
+    `WorkBuddy 剩余积分 ${total}`,
+    { modal: true, detail: lines.join('\n') },
+    ...buttons
+  );
+}
+
 async function selectAccount(id) {
   const res = await fetch(baseUrl() + '/accounts/select', {
     method: 'POST',
@@ -247,7 +617,7 @@ async function promptLoginOnce(context, force = false) {
   await context.globalState.update(PROMPT_KEY, true);
 
   const pick = await vscode.window.showInformationMessage(
-    'WorkBuddy 还没有登录账号。登录后即可在 Copilot Chat 里直接使用 WorkBuddy 的模型（消耗你自己的积分）。',
+    'WorkBuddy 还没有登录账号。登录后即可在 Copilot Chat 里直接使用 WorkBuddy 的模型。',
     '立即登录',
     '不再提示'
   );
@@ -483,12 +853,30 @@ function reportThinking(progress, text) {
 
 // ── Provider ──────────────────────────────────────────────────────
 class WorkBuddyProvider {
-  constructor() {
+  constructor(context) {
     this._onDidChange = new vscode.EventEmitter();
     this.onDidChangeLanguageModelChatInformation = this._onDidChange.event;
+    this._context = context;
   }
 
   async provideLanguageModelChatInformation(options, token) {
+    // 分组：`chatLanguageModels.json` 里每个 vendor=workbuddy 的条目会被
+    // VS Code 单独调用一次，`options.group` 是组名，`options.configuration`
+    // 是该条目里除 vendor/name/settings 之外的字段（我们用 workbuddyAccount）。
+    //
+    // ⚠️ 另有一次**不带 group** 的默认调用（源码 _resolveAllLanguageModels 里
+    //    `provideLanguageModelChatInfo({silent})`），结果会渲染成一个以 vendor
+    //    displayName（"WorkBuddy"）为标题的组。我们已经按账号分了组，如果那次
+    //    也把全部模型返回，下拉框里就会多出一个「所有账号混在一起」的重复组。
+    //    所以：只要配置文件里已有我们的分组，默认调用就返回空数组。
+    const groupName = typeof options?.group === 'string' ? options.group : '';
+    const wantAccount = String(options?.configuration?.workbuddyAccount ?? '').trim();
+
+    if (!groupName && !wantAccount && hasAccountGroups(this._context)) {
+      log('已配置账号分组 → 跳过无组的默认模型列表（避免出现混合组）');
+      return [];
+    }
+
     let models;
     try {
       models = await fetchModels();
@@ -510,21 +898,38 @@ class WorkBuddyProvider {
       return [];
     }
 
-    const chat = models.filter((m) => m.is_media !== true);
+    let chat = models.filter((m) => m.is_media !== true);
+
+    // 带账号的分组：只保留该账号的模型（workbuddyAccount 可以填 id 或昵称）
+    if (wantAccount) {
+      const hit = chat.filter(
+        (m) => m.account_id === wantAccount || m.account_name === wantAccount
+      );
+      if (hit.length) {
+        chat = hit;
+      } else {
+        // 账号没了（退登/改名）→ 不要把整组清空，退回全部，避免下拉框里凭空少东西
+        log(`分组「${groupName || '?'}」指定的账号 ${wantAccount} 不存在，本组退回全部模型`);
+      }
+    }
 
     return chat.map((m) => {
       const ctx = Number(m.context_length) || 128000;
       const maxOut = Number(m.max_output_tokens) || 32000;
-      const acct = m.account_name ? ` · ${m.account_name}` : '';
+      // base_name 是代理给的「不带账号后缀」的干净模型名；老版本代理没有这个
+      // 字段，用 base_id / id 兜底。分组里组名已标明账号，名字里不再重复。
+      const clean = m.base_name || m.base_id || m.id;
+      const name = wantAccount ? clean : `${clean} · ${m.account_name || ''}`.replace(/ · $/, '');
       return {
         id: m.id,
-        name: m.name || m.id,
+        name,
         family: 'workbuddy',
         version: '1.0.0',
-        detail: `${Math.round(ctx / 1000)}k 上下文 · WorkBuddy${acct}`,
+        detail: `${Math.round(ctx / 1000)}k 上下文 · WorkBuddy`,
         tooltip:
-          `${m.name || m.id}\n${ctx} 上下文 / ${maxOut} 输出\nWorkBuddy 积分计费` +
-          (m.account_name ? `\n账号：${m.account_name}${m.account_current ? '（桌面端当前选中）' : ''}` : ''),
+          `${clean}\n${ctx} 上下文 / ${maxOut} 输出\nWorkBuddy 积分计费` +
+          (m.account_name ? `\n账号：${m.account_name}${m.account_current ? '（桌面端当前选中）' : ''}` : '') +
+          (groupName ? `\n分组：${groupName}` : ''),
         maxInputTokens: ctx,
         maxOutputTokens: maxOut,
         isUserSelectable: true,
@@ -540,6 +945,10 @@ class WorkBuddyProvider {
     const url = getProxyUrl() + '/chat/completions';
     const tools = toOpenAITools(options?.tools);
 
+    // 模型 id 可能带账号前缀 `@<accountId>|<model>`：
+    // 用户在下拉框里选了哪个账号的模型，状态栏就显示那个账号的余额。
+    const parsed = parseAccountModelId(model.id);
+
     const body = {
       model: model.id,
       messages: toOpenAIMessages(messages),
@@ -550,6 +959,11 @@ class WorkBuddyProvider {
     if (model.maxOutputTokens) body.max_tokens = Math.min(model.maxOutputTokens, 32000);
 
     log('POST', url, 'model=' + model.id, 'tools=' + (tools?.length ?? 0));
+
+    // 跟上用户实际选的账号（不阻塞请求，失败也不影响对话）
+    if (parsed) {
+      trackAccount(parsed.accountId).catch(() => {});
+    }
 
     const ac = new AbortController();
     const sub = token.onCancellationRequested(() => ac.abort());
@@ -663,10 +1077,15 @@ async function activate(context) {
     proxyState.child = null;
   }
 
-  const provider = new WorkBuddyProvider();
+  const provider = new WorkBuddyProvider(context);
   context.subscriptions.push(
     vscode.lm.registerLanguageModelChatProvider(VENDOR, provider)
   );
+
+  // ── 状态栏：当前账号剩余积分 ──────────────────────────────────────
+  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  context.subscriptions.push(statusBar);
+  setStatusBar('idle', '$(credit-card) WorkBuddy …', '正在读取 WorkBuddy 积分…');
 
   // 手动刷新命令
   context.subscriptions.push(
@@ -676,6 +1095,8 @@ async function activate(context) {
       try {
         const list = await fetchModels(true);
         vscode.window.showInformationMessage(`WorkBuddy：已刷新 ${list.length} 个模型`);
+        // 顺手把积分也刷一下（用户主动刷新的语义）
+        await refreshCreditsStatus();
       } catch (e) {
         vscode.window.showErrorMessage('WorkBuddy：刷新失败 — ' + (e?.message || e));
       }
@@ -686,16 +1107,123 @@ async function activate(context) {
     vscode.commands.registerCommand('connect-workbuddy.showLogs', () => output.show())
   );
 
+  // ── 查看积分明细 ──────────────────────────────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('connect-workbuddy.showCredits', async () => {
+      let c;
+      try {
+        c = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Window, title: 'WorkBuddy 读取积分…' },
+          () => fetchCredits()
+        );
+      } catch (e) {
+        const pick = await vscode.window.showErrorMessage(
+          'WorkBuddy：读取积分失败 — ' + (e?.message || e),
+          '显示日志'
+        );
+        if (pick === '显示日志') output.show();
+        return;
+      }
+
+      // 有其它账号时给个按钮，直接切过去看
+      let accounts = [];
+      try {
+        accounts = (await fetchAccountsWithCredits()).accounts || [];
+      } catch { /* 拿不到就只显示当前账号 */ }
+      const others = accounts.filter((a) => a.id !== c.accountId);
+
+      const action = await showCreditsModal(c, others.length > 0);
+
+      if (action === '刷新') {
+        await refreshCreditsStatus();
+        vscode.commands.executeCommand('connect-workbuddy.showCredits');
+        return;
+      }
+      if (action === '查看其它账号' && others.length) {
+        const sel = await vscode.window.showQuickPick(
+          others.map((a) => ({
+            label: '$(account) ' + a.name,
+            description: `${formatCredits(a.credits) ?? '—'} 积分`,
+            id: a.id,
+          })),
+          { placeHolder: '选择要查看积分的账号' }
+        );
+        if (!sel) return;
+        try {
+          const other = await fetchCredits(sel.id);
+          await showCreditsModal(other, false);
+        } catch (e) {
+          vscode.window.showErrorMessage('WorkBuddy：读取积分失败 — ' + (e?.message || e));
+        }
+      }
+    })
+  );
+
+  // ── 每个账号一个模型分组 ──────────────────────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('connect-workbuddy.syncGroups', async () => {
+      let accounts = [];
+      try {
+        accounts = (await fetchAccounts()).accounts || [];
+      } catch (e) {
+        vscode.window.showErrorMessage('WorkBuddy：读取账号失败 — ' + (e?.message || e));
+        return;
+      }
+      if (!accounts.length) {
+        vscode.window.showWarningMessage('WorkBuddy：还没有账号，先登录再分组。');
+        return;
+      }
+
+      let result;
+      try {
+        result = syncAccountGroups(context, accounts);
+      } catch (e) {
+        const pick = await vscode.window.showErrorMessage(
+          'WorkBuddy：写分组配置失败 — ' + (e?.message || e),
+          '显示日志'
+        );
+        if (pick === '显示日志') output.show();
+        return;
+      }
+
+      output.appendLine(
+        `分组已同步：+${result.added.length} -${result.removed.length}（共 ${accounts.length} 组）`
+      );
+      for (const n of result.added) output.appendLine('  + ' + n);
+      for (const n of result.removed) output.appendLine('  - ' + n);
+
+      // provider 缓存要清掉，否则新组的模型列表还是旧的
+      cachedModels = null;
+      provider._onDidChange.fire();
+
+      const msg =
+        `已为 ${accounts.length} 个账号准备好模型分组` +
+        (result.added.length ? `（新增 ${result.added.length} 组）` : '') +
+        (result.removed.length ? `（移除 ${result.removed.length} 组）` : '');
+
+      const pick = await vscode.window.showInformationMessage(
+        msg,
+        '重载窗口生效',
+        '打开配置文件'
+      );
+      if (pick === '重载窗口生效') {
+        vscode.commands.executeCommand('workbench.action.reloadWindow');
+      } else if (pick === '打开配置文件') {
+        vscode.window.showTextDocument(vscode.Uri.file(result.file));
+      }
+    })
+  );
+
   // ── 登录（OAuth，不需要 WorkBuddy 桌面客户端）─────────────────────
   context.subscriptions.push(
     vscode.commands.registerCommand('connect-workbuddy.login', async () => {
       // ① 选区域
       const regionPick = await vscode.window.showQuickPick(
         [
-          { label: '国内版', description: 'www.codebuddy.cn', region: 'cn', recommended: true },
-          { label: '国际版', description: 'www.workbuddy.ai', region: 'global' },
+          { label: '国内版（CodeBuddy 账号）', description: 'www.codebuddy.cn', region: 'cn', recommended: true },
+          { label: '国际版（WorkBuddy 账号）', description: 'www.workbuddy.ai', region: 'global' },
         ],
-        { placeHolder: '选择 WorkBuddy 区域' }
+        { placeHolder: '选择要登录的区域' }
       );
       if (!regionPick) return;
       const region = regionPick.region;
@@ -774,6 +1302,9 @@ async function activate(context) {
         vscode.window.showInformationMessage(
           `WorkBuddy：已登录「${account.account.name}」，模型列表已刷新`
         );
+        await refreshCreditsStatus();
+        // 新账号 → 顺手把模型分组补齐（失败不打扰用户，日志里有）
+        await autoSyncGroups(context, { silent: true });
       }
     })
   );
@@ -783,7 +1314,8 @@ async function activate(context) {
     vscode.commands.registerCommand('connect-workbuddy.switchAccount', async () => {
       let info;
       try {
-        info = await fetchAccounts();
+        // credits=1：顺手把每个账号的剩余积分也带回来，方便直接对比
+        info = await fetchAccountsWithCredits();
       } catch (e) {
         vscode.window.showErrorMessage('WorkBuddy：读取账号失败 — ' + (e?.message || e));
         return;
@@ -795,15 +1327,23 @@ async function activate(context) {
         return;
       }
 
-      const items = info.accounts.map((a) => ({
-        label: (a.isCurrent ? '$(check) ' : '$(account) ') + a.name,
-        description: [a.source, a.desktopSelected ? '桌面端选中' : '', a.isLastUsed ? '最近使用' : '']
-          .filter(Boolean)
-          .join(' · '),
-        detail: `token 到期 ${a.tokenExpiresAt || '未知'}`,
-        id: a.id,
-        isCurrent: a.isCurrent === true,
-      }));
+      const items = info.accounts.map((a) => {
+        const credit = formatCredits(a.credits);
+        return {
+          label: (a.isCurrent ? '$(check) ' : '$(account) ') + a.name,
+          description: [
+            credit === null ? '积分 —' : `${credit} 积分`,
+            a.source,
+            a.desktopSelected ? '桌面端选中' : '',
+            a.isLastUsed ? '最近使用' : '',
+          ]
+            .filter(Boolean)
+            .join(' · '),
+          detail: `token 到期 ${a.tokenExpiresAt || '未知'}`,
+          id: a.id,
+          isCurrent: a.isCurrent === true,
+        };
+      });
 
       const pick = await vscode.window.showQuickPick(items, {
         placeHolder: '选择当前 WorkBuddy 账号（影响不带账号前缀的模型调用）',
@@ -821,6 +1361,8 @@ async function activate(context) {
         provider._onDidChange.fire();
         output.appendLine(`已切换当前账号 → ${r?.current?.name || pick.id}`);
         vscode.window.showInformationMessage(`WorkBuddy：已切换到「${r?.current?.name || pick.id}」`);
+        // 账号变了：状态栏跟踪的账号一起切过去，并绕过缓存拿新数字
+        await trackAccount(pick.id, { force: true });
       } catch (e) {
         vscode.window.showErrorMessage('WorkBuddy：切换失败 — ' + (e?.message || e));
       }
@@ -840,6 +1382,34 @@ async function activate(context) {
       output.appendLine(`已发现 ${n} 个 WorkBuddy 账号`);
       // 有账号了，重置标记，以便账号被删光后还能再弹一次
       await context.globalState.update(PROMPT_KEY, false);
+      // 每个账号一个模型分组（写了新组才提示重载，平时静默）
+      const groupResult = await autoSyncGroups(context, { silent: true });
+      if (groupResult && groupResult.added.length) {
+        const pick = await vscode.window.showInformationMessage(
+          `WorkBuddy：已为 ${n} 个账号生成模型分组，重载窗口后生效`,
+          '立即重载',
+          '稍后'
+        );
+        if (pick === '立即重载') {
+          vscode.commands.executeCommand('workbench.action.reloadWindow');
+          return;
+        }
+      }
+      // 有账号才开始读积分（零账号时白读一次）
+      await refreshCreditsStatus();
+      const startTimer = () => {
+        if (creditsTimer) clearInterval(creditsTimer);
+        creditsTimer = setInterval(() => refreshCreditsStatus({ quiet: true }), creditsRefreshMs());
+      };
+      startTimer();
+      context.subscriptions.push({ dispose: () => { if (creditsTimer) clearInterval(creditsTimer); } });
+      // 设置改了（间隔或开关）→ 重设定时器
+      context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((e) => {
+          if (e.affectsConfiguration(SECTION + '.creditsRefreshSeconds')) startTimer();
+          if (e.affectsConfiguration(SECTION + '.showCreditsInStatusBar')) refreshCreditsStatus({ quiet: true });
+        })
+      );
     } else {
       output.appendLine('⚠ 无法读取账号列表（代理可能没起来）');
     }

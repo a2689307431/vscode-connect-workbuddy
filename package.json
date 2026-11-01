@@ -1,8 +1,8 @@
 {
   "name": "vscode-connect-workbuddy",
   "displayName": "Connect WorkBuddy",
-  "description": "把 WorkBuddy 订阅额度接进 VS Code Copilot Chat 的模型下拉框（非官方）",
-  "version": "0.3.0",
+  "description": "把 WorkBuddy 的模型接进 VS Code Copilot Chat 的模型下拉框，支持多账号分组与剩余积分显示（非官方）",
+  "version": "0.5.1",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -20,7 +20,16 @@
     "languageModelChatProviders": [
       {
         "vendor": "workbuddy",
-        "displayName": "WorkBuddy"
+        "displayName": "WorkBuddy",
+        "configuration": {
+          "properties": {
+            "workbuddyAccount": {
+              "type": "string",
+              "title": "WorkBuddy 账号",
+              "markdownDescription": "该分组只显示这个账号的模型。填账号 id 或昵称；留空 = 当前账号。扩展会在「WorkBuddy: 管理账号分组」里自动维护这一项。"
+            }
+          }
+        }
       }
     ],
     "configuration": {
@@ -50,6 +59,17 @@
           "type": "boolean",
           "default": false,
           "description": "不再在启动时提示登录（仍然可以用命令面板的「WorkBuddy: 登录账号」）。"
+        },
+        "connect-workbuddy.showCreditsInStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "在状态栏显示当前账号的剩余积分（每 5 分钟刷新一次，点一下可看明细）。"
+        },
+        "connect-workbuddy.creditsRefreshSeconds": {
+          "type": "number",
+          "default": 300,
+          "minimum": 60,
+          "description": "状态栏积分的自动刷新间隔（秒），最小 60。上游按账号串行查询，不建议设得太小。"
         }
       }
     },
@@ -62,6 +82,16 @@
       {
         "command": "connect-workbuddy.switchAccount",
         "title": "WorkBuddy: 切换账号",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.showCredits",
+        "title": "WorkBuddy: 查看剩余积分",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.syncGroups",
+        "title": "WorkBuddy: 按账号生成模型分组",
         "category": "WorkBuddy"
       },
       {
