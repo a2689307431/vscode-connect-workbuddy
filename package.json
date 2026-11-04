@@ -2,7 +2,7 @@
   "name": "vscode-connect-workbuddy",
   "displayName": "Connect WorkBuddy",
   "description": "把 WorkBuddy 的模型接进 VS Code Copilot Chat 的模型下拉框，支持多账号分组与剩余积分显示（非官方）",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -70,6 +70,11 @@
           "default": 300,
           "minimum": 60,
           "description": "状态栏积分的自动刷新间隔（秒），最小 60。上游按账号串行查询，不建议设得太小。"
+        },
+        "connect-workbuddy.autoCheckin": {
+          "type": "boolean",
+          "default": false,
+          "description": "每天第一次启动 VS Code 时自动签到（默认关闭）。开启后每个账号每天最多签一次；失败会在下次启动重试。"
         }
       }
     },
@@ -87,6 +92,11 @@
       {
         "command": "connect-workbuddy.showCredits",
         "title": "WorkBuddy: 查看剩余积分",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.checkin",
+        "title": "WorkBuddy: 每日签到",
         "category": "WorkBuddy"
       },
       {

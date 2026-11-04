@@ -261,6 +261,140 @@ function clearCreditsCache(accountId, region) {
   creditsCache.delete(`${region}:${accountId}`);
 }
 
+// ── 每日签到 ──────────────────────────────────────────────────────────────
+// 接口逆向自官方客户端，2026-11-04 实测可用：
+//   POST {chat}/v2/billing/meter/checkin-activity-status  今日状态 + 连续天数
+//   POST {chat}/v2/billing/meter/daily-checkin           签到（幂等）
+// ⚠️ 只放在代理里做：签到和聊天共用同一份 token，刷新必须只有一处，
+//    否则两个进程同时写 vault 会互相覆盖。
+const CHECKIN_TIMEOUT_MS = 20_000;
+
+function checkinHeaders(cred) {
+  const h = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${cred.accessToken}`,
+    'User-Agent': 'WorkBuddy',
+  };
+  if (cred.uid) h['X-User-Id'] = cred.uid;
+  if (cred.domain) h['X-Domain'] = cred.domain;
+  if (cred.enterpriseId) {
+    h['X-Enterprise-Id'] = cred.enterpriseId;
+    h['X-Tenant-Id'] = cred.enterpriseId;
+  }
+  return h;
+}
+
+/** 响应可能裹一层 data / result，按 key 逐层找。 */
+function pickField(obj, key) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+  for (const wrap of ['data', 'result', 'resp', 'response']) {
+    const v = obj[wrap];
+    if (v && typeof v === 'object') {
+      const r = pickField(v, key);
+      if (r !== undefined && r !== null) return r;
+    }
+  }
+  return undefined;
+}
+
+async function callCheckinEndpoint(cred, path) {
+  const res = await fetch(`${chatBaseOf(cred)}${path}`, {
+    method: 'POST',
+    headers: checkinHeaders(cred),
+    body: '{}',
+    signal: AbortSignal.timeout(CHECKIN_TIMEOUT_MS),
+  });
+  const text = await res.text();
+  let body = null;
+  // 空响应体是「今日已签」的正常形态，不是解析失败
+  try { body = text ? JSON.parse(text) : null; } catch { body = null; }
+  return { http: res.status, body };
+}
+
+/** 强制刷新某个账号的 token，并同步账号池缓存。 */
+async function refreshCredFor(accountId, region, cred) {
+  try {
+    const next = await stores[region].refreshNow(cred);
+    if (!next) return null;
+    pool[region].tokens.set(accountId, next);
+    return next;
+  } catch (e) {
+    log(`账号 ${accountId} 刷新失败：${e?.message || e}`);
+    return null;
+  }
+}
+
+async function checkinStatusFor(accountId, region = 'cn') {
+  let cred = await credForAccount(accountId, region);
+  if (!cred) return { ok: false, error: 'AUTH', message: '凭据不可用' };
+
+  let { http, body } = await callCheckinEndpoint(cred, '/v2/billing/meter/checkin-activity-status');
+  if (http === 401 || http === 403) {
+    const next = await refreshCredFor(accountId, region, cred);
+    if (next) ({ http, body } = await callCheckinEndpoint(next, '/v2/billing/meter/checkin-activity-status'));
+  }
+  if (http === 401 || http === 403) return { ok: false, error: 'AUTH', message: '登录已失效，请重新登录账号' };
+  if (http < 200 || http >= 300) return { ok: false, error: 'HTTP', message: `查询失败（HTTP ${http}）` };
+
+  return {
+    ok: true,
+    active: pickField(body, 'active') !== false,
+    checkedIn: pickField(body, 'today_checked_in') === true || pickField(body, 'today_checked_in') === 1,
+    streakDays: Number(pickField(body, 'streak_days') ?? 0),
+    totalCredits: Number(pickField(body, 'total_credits') ?? 0),
+    todayCredit: Number(pickField(body, 'today_credit') ?? pickField(body, 'daily_credit') ?? 0),
+    isStreakDay: pickField(body, 'is_streak_day') === true,
+    activityName: pickField(body, 'activity_name') ?? '',
+  };
+}
+
+async function checkinFor(accountId, region = 'cn') {
+  let cred = await credForAccount(accountId, region);
+  if (!cred) return { result: 'AUTH', message: '凭据不可用' };
+
+  let { http, body } = await callCheckinEndpoint(cred, '/v2/billing/meter/daily-checkin');
+  if (http === 401 || http === 403) {
+    const next = await refreshCredFor(accountId, region, cred);
+    if (next) ({ http, body } = await callCheckinEndpoint(next, '/v2/billing/meter/daily-checkin'));
+  }
+  if (http === 401 || http === 403) return { result: 'AUTH', message: '登录已失效，请重新登录账号' };
+
+  const status = async () => {
+    const st = await checkinStatusFor(accountId, region).catch(() => null);
+    return st?.ok ? { status: st } : {};
+  };
+
+  // 已签：null 响应体，或 code 10001，或 msg 含「已签」
+  const already = body === null
+    || body?.code === 10001
+    || String(pickField(body, 'msg') ?? '').includes('已签');
+  if (already && http < 500) {
+    return { result: 'ALREADY', message: '今日已签', ...(await status()) };
+  }
+
+  const credit = pickField(body, 'credit');
+  if (credit !== undefined && credit !== null) {
+    return { result: 'CLAIMED', credit: Number(credit), message: `签到成功 +${credit} 积分`, ...(await status()) };
+  }
+  if (http >= 200 && http < 300) {
+    return { result: 'CLAIMED', message: '签到成功', ...(await status()) };
+  }
+
+  // 活动没开（新账号 / 活动已结束）时给个能看懂的结论，而不是干巴巴的 HTTP 400
+  const st = await checkinStatusFor(accountId, region).catch(() => null);
+  if (st?.ok && st.active === false) {
+    return { result: 'NO_ACTIVITY', message: '当前账号没有进行中的签到活动', status: st };
+  }
+  return {
+    result: 'ERROR',
+    message: String(pickField(body, 'msg') ?? `HTTP ${http}`),
+    http,
+    ...(st?.ok ? { status: st } : {}),
+  };
+}
+
 /** 用指定凭据发一次 chat 请求（body 必须是已整形的 JSON 字符串） */
 function fetchChat(cred, bodyJson) {
   const base = chatBaseOf(cred);
@@ -1256,6 +1390,57 @@ const server = http.createServer(async (req, res) => {
         log('GET /credits 失败：', e?.message || e);
         return send(res, 502, { error: { message: String(e?.message || e) } });
       }
+    }
+
+    // 每日签到：查今日状态
+    //   GET /checkin/status?region=cn → 每个账号 { checkedIn, streakDays, todayCredit }
+    if (p === '/checkin/status' && req.method === 'GET') {
+      const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      let list = [];
+      try {
+        list = await listAccounts(region);
+      } catch (e) {
+        return send(res, 500, { error: { message: String(e?.message || e) } });
+      }
+      const accounts = await Promise.all(list.map(async (a) => {
+        const st = await checkinStatusFor(a.id, region)
+          .catch((e) => ({ ok: false, error: 'EXCEPTION', message: String(e?.message || e) }));
+        return { id: a.id, name: a.accountName, ...st };
+      }));
+      return send(res, 200, { ok: true, region, accounts });
+    }
+
+    // 每日签到：执行（幂等，已签返回 ALREADY）
+    //   POST /checkin  { ids?: string[] } → 逐账号 { result, credit, status }
+    if (p === '/checkin' && req.method === 'POST') {
+      let body = {};
+      try {
+        const raw = await readBody(req);
+        if (raw) body = JSON.parse(raw);
+      } catch { /* 允许空 body = 全部账号 */ }
+      const region = body.__region === 'global' ? 'global' : 'cn';
+      const ids = Array.isArray(body.ids) && body.ids.length ? body.ids : null;
+
+      let list = [];
+      try {
+        list = await listAccounts(region);
+      } catch (e) {
+        return send(res, 500, { error: { message: String(e?.message || e) } });
+      }
+      const targets = ids ? list.filter((a) => ids.includes(a.id)) : list;
+
+      const results = await Promise.all(targets.map(async (a) => {
+        try {
+          const r = await checkinFor(a.id, region);
+          if (r.result === 'CLAIMED' || r.result === 'ALREADY') clearCreditsCache(a.id, region);
+          return { id: a.id, name: a.accountName, ...r };
+        } catch (e) {
+          return { id: a.id, name: a.accountName, result: 'ERROR', message: `异常：${e?.message || e}` };
+        }
+      }));
+
+      log(`签到：${results.map((r) => `${r.name}:${r.result}`).join('  ') || '(没有账号)'}`);
+      return send(res, 200, { ok: true, region, at: new Date().toISOString(), results });
     }
 
     // 手动切换当前账号（内存态；不落盘，重启代理后回到桌面端选中的那个）

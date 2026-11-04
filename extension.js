@@ -225,6 +225,161 @@ async function fetchAccountsWithCredits() {
   return j;
 }
 
+// ── 每日签到 ──────────────────────────────────────────────────────
+// 逻辑放在代理里（和聊天共用同一份 token），这里只负责调用和展示。
+async function fetchCheckinStatus() {
+  const res = await fetch(baseUrl() + '/checkin/status', {
+    headers: { authorization: 'Bearer ' + getApiKey() },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j?.error?.message || `GET /checkin/status 返回 HTTP ${res.status}`);
+  return j;
+}
+
+async function postCheckin(ids) {
+  const res = await fetch(baseUrl() + '/checkin', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + getApiKey() },
+    body: JSON.stringify(Array.isArray(ids) && ids.length ? { ids } : {}),
+    signal: AbortSignal.timeout(90_000),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 404) {
+      throw new Error(
+        '当前代理不支持签到（可能是旧版或外部代理）。请清空 connect-workbuddy.proxyUrl 让扩展自己拉起代理，或升级外部代理。'
+      );
+    }
+    throw new Error(j?.error?.message || `POST /checkin 返回 HTTP ${res.status}`);
+  }
+  return j;
+}
+
+let checkinRunning = false;
+
+function localDayKey(d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 跑一轮签到并汇报。silent = 不弹窗（自动签到用）。 */
+async function performCheckin({ silent = false, ids = null } = {}) {
+  if (checkinRunning) {
+    if (!silent) vscode.window.showInformationMessage('WorkBuddy：正在签到中，请稍候');
+    return null;
+  }
+  checkinRunning = true;
+  try {
+    return await doCheckin({ silent, ids });
+  } finally {
+    checkinRunning = false;
+  }
+}
+
+async function doCheckin({ silent = false, ids = null } = {}) {
+  const j = await postCheckin(ids);
+  const results = Array.isArray(j.results) ? j.results : [];
+  const claimed = results.filter((r) => r.result === 'CLAIMED');
+  const already = results.filter((r) => r.result === 'ALREADY');
+  const failed = results.filter((r) => r.result !== 'CLAIMED' && r.result !== 'ALREADY');
+
+  output.appendLine(
+    `签到：成功 ${claimed.length}，已签 ${already.length}` + (failed.length ? `，失败 ${failed.length}` : '')
+  );
+  for (const r of results) {
+    output.appendLine(`  ${r.name || r.id}: ${r.result}${r.credit ? ' +' + r.credit : ''} ${r.message || ''}`);
+  }
+
+  if (claimed.length) await refreshCreditsStatus({ quiet: true, force: true });
+
+  if (!silent) {
+    const detail = results.length
+      ? results.map((r) => {
+        const streak = r.status?.streakDays ? `（连续 ${r.status.streakDays} 天）` : '';
+        return `${r.name || r.id}：${r.message || r.result}${streak}`;
+      }).join('\n')
+      : '还没有登录任何账号。';
+
+    if (!results.length) {
+      await vscode.window.showInformationMessage(
+        'WorkBuddy：还没有登录账号，先执行「WorkBuddy: 登录账号」',
+        { modal: true, detail }
+      );
+    } else if (failed.length && !claimed.length && !already.length) {
+      await vscode.window.showErrorMessage('WorkBuddy：签到失败', { modal: true, detail });
+    } else {
+      const headline = claimed.length
+        ? `WorkBuddy：签到成功 ${claimed.length} 个账号` +
+          (claimed[0]?.credit ? `，+${claimed[0].credit} 积分` : '')
+        : failed.length
+          ? `WorkBuddy：${failed.length} 个账号签到失败`
+          : 'WorkBuddy：今天已经签过了';
+      await vscode.window.showInformationMessage(headline, { modal: true, detail });
+    }
+  }
+  return { claimed, already, failed, results };
+}
+
+const AUTO_CHECKIN_KEY = 'autoCheckinDay';
+
+/**
+ * 自动签到：每天最多一次，只在用户显式开启 `autoCheckin` 时执行。
+ * 全部失败时不记日期，下次开窗口还会再试。
+ */
+async function maybeAutoCheckin(context) {
+  const cfg = vscode.workspace.getConfiguration(SECTION);
+  if (cfg.get('autoCheckin') !== true) return null;
+  if ((await checkAccountCount()) <= 0) return null;
+
+  const day = localDayKey();
+  if (context.globalState.get(AUTO_CHECKIN_KEY) === day) {
+    log('自动签到：今天已经跑过');
+    return null;
+  }
+
+  // 服务端「今天」的分界在 0 点附近。太早跑可能把昨天当成今天，
+  // 所以 02:00 前先不签，改成 02:05 再补一次（窗口一直开着也能补上）。
+  const now = new Date();
+  if (now.getHours() < 2) {
+    const target = new Date(now);
+    target.setHours(2, 5, 0, 0);
+    const waitMs = Math.max(1000, target - now);
+    const timer = setTimeout(() => {
+      maybeAutoCheckin(context).catch((e) => output.appendLine('自动签到异常：' + (e?.message || e)));
+    }, waitMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    context.subscriptions.push({ dispose: () => clearTimeout(timer) });
+    output.appendLine(`自动签到：等到 02:05 再签（约 ${Math.round(waitMs / 60000)} 分钟后）`);
+    return null;
+  }
+
+  // 等启动时的模型拉取/积分刷新忙完再发
+  await new Promise((r) => setTimeout(r, 10_000));
+
+  try {
+    const out = await performCheckin({ silent: true });
+    if (!out || !out.results.length) {
+      output.appendLine('自动签到：没有可签到的账号');
+      return out;
+    }
+    // 只有所有账号都确认过（成功或今日已签）才记日期；有失败就下次启动重试
+    if (out.failed.length) {
+      output.appendLine(`自动签到：${out.failed.length} 个账号失败，今天稍后启动会重试`);
+      return out;
+    }
+    await context.globalState.update(AUTO_CHECKIN_KEY, day);
+    if (out.claimed.length) {
+      const names = out.claimed.map((r) => r.name || r.id).join('、');
+      vscode.window.showInformationMessage(`WorkBuddy：已自动签到（${names}）`);
+    }
+    return out;
+  } catch (e) {
+    output.appendLine('自动签到失败：' + (e?.message || e));
+    return null;
+  }
+}
+
 // ── 状态栏积分 ────────────────────────────────────────────────────
 // 状态栏跟随「你实际在用哪个账号」：
 //   · 模型 id 形如 `@<accountId>|<model>`（代理 /v1/models?perAccount=1 生成），
@@ -541,10 +696,18 @@ async function autoSyncGroups(context, { silent = true } = {}) {
  * 把一次积分响应整理成弹窗文本。
  * 返回用户点了哪个按钮（'刷新' / '查看其它账号' / undefined）。
  */
-async function showCreditsModal(c, allowSwitch) {
+async function showCreditsModal(c, allowSwitch, checkin = null) {
   const total = formatCredits(c.total) ?? '—';
   const lines = [`账号：${c.accountName || c.accountId || '当前账号'}`, `剩余合计：${total} 积分`];
 
+  if (checkin?.ok && checkin.checkedIn) {
+    lines.push(
+      `今日已签到 · 连续 ${checkin.streakDays} 天` +
+      (checkin.todayCredit ? ` · 今日 +${checkin.todayCredit}` : '')
+    );
+  } else if (checkin?.ok) {
+    lines.push('今日尚未签到（命令面板 → WorkBuddy: 每日签到）');
+  }
   if (c.nearestExpiry) lines.push(`最近到期：${new Date(c.nearestExpiry).toLocaleString()}`);
   if (c.expiringSoon > 0) {
     lines.push(`注意：其中 ${formatCredits(c.expiringSoon)} 将在 30 天内过期`);
@@ -1118,6 +1281,20 @@ async function activate(context) {
     })
   );
 
+  // ── 每日签到 ──────────────────────────────────────────────────────
+  context.subscriptions.push(
+    vscode.commands.registerCommand('connect-workbuddy.checkin', async () => {
+      try {
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'WorkBuddy 签到中…' },
+          () => performCheckin({ silent: false })
+        );
+      } catch (e) {
+        vscode.window.showErrorMessage('WorkBuddy：签到失败 — ' + (e?.message || e));
+      }
+    })
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand('connect-workbuddy.showLogs', () => output.show())
   );
@@ -1147,7 +1324,14 @@ async function activate(context) {
       } catch { /* 拿不到就只显示当前账号 */ }
       const others = accounts.filter((a) => a.id !== c.accountId);
 
-      const action = await showCreditsModal(c, others.length > 0);
+      // 签到状态是加分项：拿不到就只展示积分
+      let checkin = null;
+      try {
+        const st = await fetchCheckinStatus();
+        checkin = (st.accounts || []).find((a) => a.id === c.accountId) || null;
+      } catch { /* ignore */ }
+
+      const action = await showCreditsModal(c, others.length > 0, checkin);
 
       if (action === '刷新') {
         await refreshCreditsStatus();
@@ -1166,7 +1350,7 @@ async function activate(context) {
         if (!sel) return;
         try {
           const other = await fetchCredits(sel.id);
-          await showCreditsModal(other, false);
+          await showCreditsModal(other, false, null);
         } catch (e) {
           vscode.window.showErrorMessage('WorkBuddy：读取积分失败 — ' + (e?.message || e));
         }
@@ -1412,6 +1596,8 @@ async function activate(context) {
       }
       // 有账号才开始读积分（零账号时白读一次）
       await refreshCreditsStatus();
+      // 自动签到默认关闭；开启后每天最多一次，不阻塞激活流程
+      maybeAutoCheckin(context).catch((e) => output.appendLine('自动签到异常：' + (e?.message || e)));
       const startTimer = () => {
         if (creditsTimer) clearInterval(creditsTimer);
         creditsTimer = setInterval(() => refreshCreditsStatus({ quiet: true }), creditsRefreshMs());
