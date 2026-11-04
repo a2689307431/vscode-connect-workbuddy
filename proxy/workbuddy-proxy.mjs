@@ -659,6 +659,21 @@ async function refreshModelIds(region = 'cn') {
   return false;
 }
 
+// 同一区域同时只跑一次目录请求。调用方可以 await 到「目录已就绪」，
+// 避免在目录还没回来时把内置兜底表发出去 —— 那份表少了 deepseek-v4.1-flash
+// 等模型，客户端一缓存，下拉框里就会一直缺。
+const catalogJobs = { cn: null, global: null };
+
+function ensureCatalog(region = 'cn', { force = false } = {}) {
+  if (!force && modelState[region]?.catalog) return Promise.resolve(true);
+  if (!catalogJobs[region]) {
+    catalogJobs[region] = refreshModelIds(region).finally(() => {
+      catalogJobs[region] = null;
+    });
+  }
+  return catalogJobs[region];
+}
+
 // 探测哪些模型真的能调通。只探测 chat 模型（跳过生图/生视频）。
 async function verifyModels(region = 'cn') {
   const catalog = modelState[region]?.catalog ?? null;
@@ -1320,6 +1335,14 @@ const server = http.createServer(async (req, res) => {
     //   ?perAccount=1 → 按账号展开：同一模型 × 每个账号各一条，id 形如 @<accountId>|<model>
     if ((p === '/v1/models' || p === '/models') && req.method === 'GET') {
       const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      // 目录是 listen 之后才异步拉的。客户端可能在 READY 后几毫秒就来问，
+      // 这时先等目录（最多 6 秒），别把兜底表发出去。
+      if (!modelState[region]?.catalog) {
+        await Promise.race([
+          ensureCatalog(region),
+          new Promise((r) => setTimeout(r, 6000)),
+        ]);
+      }
       const base = modelList(region);
 
       if (u.searchParams.get('perAccount') !== '1') return send(res, 200, base);
@@ -1373,7 +1396,7 @@ const server = http.createServer(async (req, res) => {
     // 手动重跑模型可用性探测
     if (p === '/refresh-models' && req.method === 'POST') {
       const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
-      await refreshModelIds(region);
+      await ensureCatalog(region, { force: true });
       await verifyModels(region);
       const st = modelState[region] ?? modelState.cn;
       return send(res, 200, {
@@ -1472,7 +1495,7 @@ server.listen(PORT, '127.0.0.1', async () => {
       console.log(`  账号池 : ${accts.length} 个 → ${accts.map((a) => a.accountName).join(' / ')}`);
       console.log(`  当前   : ${cur?.accountName || '?'}（模型列表按账号分组，选带账号名的模型即锁定该账号）`);
     }
-    await refreshModelIds(region); // 拉目录（权威清单）
+    await ensureCatalog(region);   // 拉目录（权威清单）
     await verifyModels(region);    // 探测哪些真能用
   } catch (e) {
     console.log(`  ⚠ 还没有可用的 WorkBuddy 账号`);

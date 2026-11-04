@@ -2,7 +2,7 @@
   "name": "vscode-connect-workbuddy",
   "displayName": "Connect WorkBuddy",
   "description": "把 WorkBuddy 的模型接进 VS Code Copilot Chat 的模型下拉框，支持多账号分组与剩余积分显示（非官方）",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "publisher": "local",
   "license": "MIT",
   "engines": {
