@@ -2,9 +2,11 @@
 // 只发一次最小请求（约 0.x 积分）。
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
-const LIB = 'C:/Users/Lenovo/.dsh/profiles/web/node_modules/dsh-connect-workbuddy/lib';
+// 默认用仓库内嵌的 lib；要测别的版本就设 WB_CONNECT_LIB
+const LIB = process.env.WB_CONNECT_LIB
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'lib');
 
 // 文件名带 hash，升级会变 → 动态找
 const hbFile = fs.readdirSync(LIB).find((f) => /^host-heartbeat-.*\.js$/.test(f));
