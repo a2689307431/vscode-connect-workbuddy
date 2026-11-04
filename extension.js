@@ -13,7 +13,7 @@ const vscode = require('vscode');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 
 const SECTION = 'connect-workbuddy';
 const VENDOR = 'workbuddy';
@@ -82,7 +82,6 @@ function resolveNodeBinary() {
   }
   // 从 PATH 里找
   try {
-    const { execFileSync } = require('node:child_process');
     const which = process.platform === 'win32' ? 'where' : 'which';
     const out = execFileSync(which, ['node'], { encoding: 'utf8', windowsHide: true, timeout: 3000 });
     const first = String(out).split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
@@ -419,11 +418,13 @@ function readModelsConfig(file) {
   }
 }
 
-/** 写回（先备份一次，原子写）。 */
+/** 写回（首次改动前备份一次，原子写）。 */
 function writeModelsConfig(file, list) {
   try {
-    if (fs.existsSync(file)) {
-      fs.copyFileSync(file, file + '.workbuddy-bak');
+    // 只保留「扩展第一次改动之前」的原件；后续重写不覆盖，避免备份跟着一起坏掉
+    const bak = file + '.workbuddy-bak';
+    if (fs.existsSync(file) && !fs.existsSync(bak)) {
+      fs.copyFileSync(file, bak);
     }
     const tmp = file + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(list, null, 2) + '\n', 'utf8');
@@ -495,9 +496,12 @@ function syncAccountGroups(context, accounts) {
   const removed = [...before].filter((n) => !after.has(n));
   const kept = [...after].filter((n) => before.has(n));
 
-  // 顺序保持：别人的组在前，我们的组在后
-  writeModelsConfig(file, [...others, ...want]);
-  return { added, removed, kept, file };
+  // 顺序保持：别人的组在前，我们的组在后。
+  // 内容没变就不写 —— 否则每次激活都 touch 一次用户配置，还会触发文件监听。
+  const next = [...others, ...want];
+  const changed = JSON.stringify(next) !== JSON.stringify(list);
+  if (changed) writeModelsConfig(file, next);
+  return { added, removed, kept, changed, file };
 }
 
 /**
@@ -802,6 +806,17 @@ async function* readSSE(body) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') return;
+        try {
+          yield JSON.parse(payload);
+        } catch { /* 跳过坏行 */ }
+      }
+    }
+
+    // 上游不保证最后一行以换行结尾，EOF 时把残留的 data 行也处理掉
+    const tail = buffer.trim();
+    if (tail.startsWith('data:')) {
+      const payload = tail.slice(5).trim();
+      if (payload && payload !== '[DONE]') {
         try {
           yield JSON.parse(payload);
         } catch { /* 跳过坏行 */ }
@@ -1419,10 +1434,20 @@ async function activate(context) {
 function deactivate() {
   // 只杀自己拉起的那个；复用外部代理时 child 为 null，不动它
   if (proxyState.child) {
-    try {
-      proxyState.child.kill();
-    } catch { /* ignore */ }
+    const child = proxyState.child;
     proxyState.child = null;
+    try {
+      if (process.platform === 'win32' && child.pid) {
+        // Windows 上 child.kill() 不保证结束整棵进程树，会留下僵尸代理
+        execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true, stdio: 'ignore', timeout: 3000,
+        });
+      } else {
+        child.kill();
+      }
+    } catch {
+      try { child.kill(); } catch { /* ignore */ }
+    }
   }
   proxyState.url = '';
   proxyState.token = '';
