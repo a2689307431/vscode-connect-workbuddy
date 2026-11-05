@@ -1,3 +1,9 @@
 {
-  "type": "module"
+  "type": "module",
+  "upstream": {
+    "package": "dsh-connect-workbuddy",
+    "version": "5.18.2",
+    "file": "host-heartbeat-DFqDsnte.js",
+    "sha256": "87c44d8f2c7c8f37b103233a06efdaf70cb924824d1acd758da7c93e0d1afa3b"
+  }
 }

@@ -25,7 +25,7 @@
 - 👥 **多账号** —— 登录多个账号，模型按账号分组列出，随时切换
 - 💳 **状态栏看余额** —— 当前账号的剩余积分常驻状态栏，切账号自动跟着换
 - 📅 **每日签到** —— 一个命令给所有账号签到，积分明细里直接看到连续天数
-- 🔌 **零依赖** —— 不用装 Node.js，扩展自己管理后台进程
+- 🔌 **零依赖** —— 不用装 Node.js，也不用装 WorkBuddy 桌面客户端，扩展自己管理后台进程
 - 🛑 **不留后台** —— 关闭 VS Code，为它拉起的进程自动退出
 
 ---
@@ -106,7 +106,7 @@ WorkBuddy
 登录了多个账号后，下拉框会按账号分成几个组（见下面的 [多账号](#多账号)）：
 
 ```
-WorkBuddy · 191****8553          WorkBuddy · 初見
+WorkBuddy · 我的账号              WorkBuddy · 公司账号
   ├─ DeepSeek-V4.1-Flash           ├─ DeepSeek-V4.1-Flash
   ├─ GLM-5.3                       ├─ GLM-5.3
   └─ ...                           └─ ...
@@ -245,9 +245,46 @@ VS Code Copilot Chat
 2. 没有账号：执行 `WorkBuddy: 登录账号`
 3. 日志里报代理起不来：设置 `connect-workbuddy.nodePath` 指向一个可用的 node 可执行文件
 
+### 登录会被自动续期吗
+
+会。凭据里有两把钥匙：
+
+| 字段 | 有效期 | 作用 |
+|---|---|---|
+| `accessToken` | 约 **30 天** | 每个请求实际带的那个 |
+| `refreshToken` | 约 **60 天** | 用来换新的 accessToken |
+
+代理在 accessToken 剩不到 6 小时时自动续期，续期结果会写回本地 vault。
+所以正常情况下**不需要手动重新登录**——除非 `refreshToken` 本身失效了
+（过期、被服务端吊销、或同一账号在别处重新登录导致旧的一串失效）。
+
+> 曾经出现过「只用了两天就提示登录失效」的情况，日志里其实是
+> `fetch failed`（网络不通），并不是凭据过期。注意区分这两类。
+
 ### 报了 401 / 11217 / 未登录
 
-凭据过期。执行 `WorkBuddy: 登录账号` 重新登录一次。
+凭据过期或被吊销。执行 `WorkBuddy: 登录账号` 重新登录一次。
+
+### 日志里出现 `fetch failed`
+
+这是**网络层**错误（DNS 解析失败、连接被重置、超时、被代理软件拦截），
+和登录状态无关 —— 重新登录解决不了根本问题。
+
+新版日志会把真正的原因带出来，例如：
+
+```
+模型目录异常：fetch failed ← ENOTFOUND / getaddrinfo ENOTFOUND copilot.tencent.com
+模型目录异常：fetch failed ← ECONNRESET
+```
+
+排查方向：
+
+1. 换个网络试（手机热点），确认不是本地网络/路由器问题
+2. 关闭代理软件（Clash / v2ray 等）的 TUN 模式或换规则再试
+3. 公司网络/校园网可能拦截了 `copilot.tencent.com`，用浏览器打开确认
+4. Windows 上偶尔是 IPv6 解析问题：新版 Node（22+）才默认开启 happy-eyeballs
+
+> 如果浏览器能打开 codebuddy.cn 但扩展报 `fetch failed`，优先怀疑第 2、4 条。
 
 ### 报了 14003 / 模型繁忙
 
@@ -276,6 +313,29 @@ VS Code Copilot Chat
 
 说明 `chatLanguageModels.json` 里有旧版残留的条目。
 删掉那几条后再重载窗口，然后执行 `WorkBuddy: 按账号生成模型分组` 重建。
+
+### 登录成功了，但账号数没有增加
+
+如果那个账号之前已经登录过，扩展会明确提示「这个账号之前已经登录过了」。
+常见原因是**浏览器里还留着上一个账号的登录状态**，点授权页时自动沿用了旧账号。
+
+处理办法：先在浏览器里退出 WorkBuddy / CodeBuddy 登录，或用无痕窗口打开授权页，
+再执行一次 `WorkBuddy: 登录账号`。
+
+### 账号数比实际少一个
+
+扩展默认只读自己 `globalStorage` 下的 vault。如果你之前用**别的工具**
+（DSH 插件、签到工具等）登录过账号，那份凭据在 `~/.dsh/workbuddy-vault/` 里，
+扩展会在启动时把缺失的账号**自动补齐**过来（只读旧目录，不删不改）。
+
+日志里会有一行：
+
+```
+导入   : 另一个账号（来自旧 vault）
+```
+
+没生效的话执行一次 `WorkBuddy: 刷新模型列表`，或检查 `~/.dsh/workbuddy-vault/<区域>/`
+里是否有对应的 `*.json`。
 
 ### 签到报「当前代理不支持签到」
 
@@ -307,6 +367,10 @@ VS Code Copilot Chat
 - 对话内容只在你、VS Code、WorkBuddy 服务端之间传输
 - 扩展不做任何遥测，不上报任何数据
 - 登录凭据存在本机 VS Code 的 `globalStorage` 目录下 `vault/` 子目录中
+- 设备标识用的随机盐（64 字符，**不是凭据、不含账号信息**）也放在
+  `globalStorage` 下的 `dsh-home/` 里 —— **不会往家目录写任何文件**
+- 如果机器上原本就有 `~/.dsh`（装过 DSH 插件），扩展会**只读**它来补上缺失的账号，
+  并把已有的设备盐复制一份过来（保持设备身份不变），之后不再读写该目录
 
 ---
 
@@ -328,11 +392,11 @@ VS Code Copilot Chat
 
 | 项目 | 许可 | 本项目的使用方式 |
 |---|---|---|
-| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**，并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
+| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**（当前对应其 `5.18.2`），并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
 | `Sliverkiss/workbuddy2api` | MIT | 上游协议细节（基址选择、强制流式、CLI 形态请求头）的参考实现 |
 | `corrinehu/dsh-workbuddy-connect` | MIT | 本地代理的入站加固（回环校验、随机端口、随机 secret）与错误映射设计的参考 |
 
-其中 `lib/host-heartbeat-BtMcdOIa.js` 是**原样再分发**，
+其中 `lib/host-heartbeat-DFqDsnte.js` 是**原样再分发**（仅在文件头追加了归属说明），
 文件头保留了原始版权与许可声明，请勿删除。
 
 ---

@@ -11,6 +11,7 @@
 
 const vscode = require('vscode');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, execFileSync } = require('node:child_process');
@@ -138,12 +139,25 @@ async function ensureProxy(context) {
   // 凭据存储目录交给扩展管理 —— 这样不依赖 ~/.dsh，也不依赖 WorkBuddy 桌面端。
   // OAuth 登录拿到的账号会写到 globalStoragePath 下。
   const vaultDir = path.join(context.globalStoragePath, 'vault');
-  try {
-    fs.mkdirSync(vaultDir, { recursive: true });
-  } catch { /* ignore */ }
+  // 内嵌模块是 DSH 插件，会往 $DSH_HOME 写设备盐。这里把它指到扩展自己的目录，
+  // 家目录一个文件都不新增；旧的 ~/.dsh 只作为「读取旧账号」的来源。
+  const dshHome = path.join(context.globalStoragePath, 'dsh-home');
+  const realDshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  for (const d of [vaultDir, dshHome]) {
+    try {
+      fs.mkdirSync(d, { recursive: true });
+    } catch { /* ignore */ }
+  }
 
   const child = spawn(node.cmd, [...node.args, script, '--port', '0'], {
-    env: { ...process.env, WB_PROXY_TOKEN: token, WB_VAULT_DIR: vaultDir, ...node.env },
+    env: {
+      ...process.env,
+      WB_PROXY_TOKEN: token,
+      WB_VAULT_DIR: vaultDir,
+      WB_DSH_HOME: dshHome,
+      WB_LEGACY_DSH_HOME: realDshHome,
+      ...node.env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -420,7 +434,7 @@ function formatCredits(n) {
 
 /**
  * 状态栏里的账号名要短。
- * 手机号会脱敏成 `191****8553`（本来就短），昵称则截到 8 个字。
+ * 手机号上游本来就会脱敏（如 `138****0000`，自身就短），昵称则截到 8 个字。
  */
 function shortenAccountName(name) {
   const s = String(name || '').trim();
@@ -1162,11 +1176,30 @@ class WorkBuddyProvider {
         let msg = txt;
         try {
           const j = JSON.parse(txt);
-          msg = j?.error?.detail ?? j?.error?.message ?? txt;
-          // detail 可能是嵌套 JSON
-          try { msg = JSON.parse(msg).msg ?? msg; } catch { /* 保持原样 */ }
+          // 代理给的是「能看懂的一句话」+ 原始失败体，两个都要
+          const friendly = j?.error?.message;
+          const detail = j?.error?.detail;
+          if (friendly) {
+            let extra = typeof detail === 'string' ? detail : '';
+            // detail 可能是嵌套的 JSON 信封，取里面的 msg
+            if (extra) {
+              try {
+                const nested = JSON.parse(extra);
+                extra = nested?.msg || nested?.displayMsg || extra;
+              } catch { /* 保持原样 */ }
+            }
+            msg = extra && !String(extra).includes(String(friendly))
+              ? `${friendly}：${String(extra).slice(0, 300)}`
+              : String(friendly);
+          } else if (detail) {
+            msg = String(detail);
+          }
         } catch { /* 保持原样 */ }
-        throw new Error(`WorkBuddy 返回 HTTP ${res.status}: ${String(msg).slice(0, 500)}`);
+        // 401/403 才和登录有关；其它状态码别让用户白重登一次
+        const hint = res.status === 401 || res.status === 403
+          ? '\n登录可能已失效：命令面板 → 「WorkBuddy: 登录账号」重新登录。'
+          : '';
+        throw new Error(`WorkBuddy 返回 HTTP ${res.status}: ${String(msg).slice(0, 500)}${hint}`);
       }
 
       const pendingToolCalls = new Map();
@@ -1427,6 +1460,13 @@ async function activate(context) {
       if (!regionPick) return;
       const region = regionPick.region;
 
+      // 记下登录前已有账号：登录完如果还是其中某个，说明浏览器用的是旧会话，
+      // 用户以为换了账号其实没换。
+      let beforeIds = new Set();
+      try {
+        beforeIds = new Set(((await fetchAccounts()).accounts || []).map((a) => a.id));
+      } catch { /* 拿不到就不做这个判断 */ }
+
       // ② 发起登录
       let started;
       try {
@@ -1497,10 +1537,32 @@ async function activate(context) {
         accountCountCache = { value: -1, at: 0 }; // 强制重新查
         await context.globalState.update(PROMPT_KEY, false);
         provider._onDidChange.fire();
-        output.appendLine(`登录成功 → ${account.account.name}（${account.account.id}）`);
-        vscode.window.showInformationMessage(
-          `WorkBuddy：已登录「${account.account.name}」，模型列表已刷新`
+        const wasExisting = beforeIds.has(account.account.id);
+        output.appendLine(
+          `登录成功 → ${account.account.name}（${account.account.id}）` +
+          (wasExisting ? '  ← 这个账号之前已经登录过' : '')
         );
+        if (wasExisting) {
+          // 浏览器里还留着上一个账号的登录状态时，点授权页会自动沿用旧账号
+          const pick = await vscode.window.showWarningMessage(
+            `WorkBuddy：这个账号「${account.account.name}」之前已经登录过了，账号数没有增加。`,
+            {
+              modal: true,
+              detail:
+                '要添加另一个账号，请先在浏览器里退出 WorkBuddy / CodeBuddy 登录，' +
+                '或者用无痕窗口打开授权页，然后再执行一次「WorkBuddy: 登录账号」。',
+            },
+            '重新登录'
+          );
+          if (pick === '重新登录') {
+            vscode.commands.executeCommand('connect-workbuddy.login');
+            return;
+          }
+        } else {
+          vscode.window.showInformationMessage(
+            `WorkBuddy：已登录「${account.account.name}」，模型列表已刷新`
+          );
+        }
         await refreshCreditsStatus();
         // 新账号 → 顺手把模型分组补齐（失败不打扰用户，日志里有）
         await autoSyncGroups(context, { silent: true });

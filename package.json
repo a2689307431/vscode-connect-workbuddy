@@ -2,7 +2,7 @@
   "name": "vscode-connect-workbuddy",
   "displayName": "Connect WorkBuddy",
   "description": "把 WorkBuddy 的模型接进 VS Code Copilot Chat 的模型下拉框，支持多账号分组与剩余积分显示（非官方）",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -53,7 +53,7 @@
         "connect-workbuddy.nodePath": {
           "type": "string",
           "default": "",
-          "description": "运行代理用的 node.exe 路径。留空自动探测 D:/A.Software/Node.js/node.exe 和 C:/Program Files/nodejs/node.exe，都找不到时用 VS Code 自带的 Electron（ELECTRON_RUN_AS_NODE）。"
+          "description": "运行代理用的 node 可执行文件路径。留空会自动探测常见安装位置和 PATH，都找不到时用 VS Code 自带的 Electron（ELECTRON_RUN_AS_NODE）。"
         },
         "connect-workbuddy.hideLoginPrompt": {
           "type": "boolean",
@@ -131,5 +131,8 @@
     "chat",
     "llm",
     "openai-compatible"
-  ]
+  ],
+  "scripts": {
+    "check:upstream": "node scripts/check-upstream.mjs"
+  }
 }

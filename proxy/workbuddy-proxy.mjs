@@ -9,9 +9,39 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+
+// ── DSH 主目录：宿主 vs 我们的私有目录 ────────────────────────────────────
+// 内嵌模块是 DSH 插件，它把「设备盐」之类的东西放在 $DSH_HOME 下。
+// 本扩展不是 DSH，所以：
+//   · WB_DSH_HOME        → 扩展自己的存储目录，**覆盖** $DSH_HOME 给模块用
+//   · WB_LEGACY_DSH_HOME → 机器上真实的 ~/.dsh，只用来**读取**旧账号
+// 覆盖必须在 import 模块之前完成（模块每次调用都会重新读 process.env）。
+const REAL_DSH_HOME = process.env.WB_LEGACY_DSH_HOME
+  || process.env.DSH_HOME
+  || path.join(os.homedir(), '.dsh');
+
+const PRIVATE_DSH_HOME = String(process.env.WB_DSH_HOME || '').trim();
+if (PRIVATE_DSH_HOME) {
+  try {
+    fs.mkdirSync(PRIVATE_DSH_HOME, { recursive: true });
+  } catch { /* 建不出来就让模块自己报 unwritable，别在启动时崩 */ }
+
+  // 换目录不该换设备身份：老用户 ~/.dsh 里已有盐的话，先复制过来，
+  // 这样上游看到的还是同一台设备。只复制一次，之后只写我们自己的。
+  try {
+    const own = path.join(PRIVATE_DSH_HOME, '.workbuddy-device.json');
+    const legacy = path.join(REAL_DSH_HOME, '.workbuddy-device.json');
+    if (!fs.existsSync(own) && fs.existsSync(legacy)) {
+      fs.copyFileSync(legacy, own);
+    }
+  } catch { /* ignore */ }
+
+  process.env.DSH_HOME = PRIVATE_DSH_HOME;
+}
 
 // ── 参数 ──────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -74,10 +104,35 @@ function findHeartbeatFile() {
 
 const hbPath = findHeartbeatFile();
 const mod = await import(pathToFileURL(hbPath).href);
-const Store = mod.C;   // WorkBuddyCredentialStore
-const Client = mod.V;  // WorkBuddyUpstreamClient
-const FALLBACK_MODELS = mod.p || [];        // 国内
-const FALLBACK_MODELS_GLOBAL = mod.m || []; // 国际
+
+// ⚠️ 这个模块是打包产物，导出的**别名是压缩后的短名**（mod.C / mod.V / mod.rt…），
+// 每次上游发版都可能变（5.13.1 → 5.18.2 就整批换了一遍）。所以按**原始导出名**
+// 去文件里查别名，查不到才退回旧短名。这样升级只换文件、不改代码。
+function exportAliases(file) {
+  const src = fs.readFileSync(file, 'utf8');
+  const at = src.lastIndexOf('export {');
+  const map = new Map();
+  if (at < 0) return map;
+  const stmt = src.slice(at, src.indexOf('}', at));
+  for (const m of stmt.matchAll(/([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g)) map.set(m[1], m[2]);
+  return map;
+}
+
+const ALIASES = exportAliases(hbPath);
+
+/** 按原始导出名取，取不到再用旧版本的短名兜底。 */
+function pickExport(realName, ...legacyAliases) {
+  const alias = ALIASES.get(realName);
+  if (alias && mod[alias] !== undefined) return mod[alias];
+  for (const a of legacyAliases) if (mod[a] !== undefined) return mod[a];
+  return undefined;
+}
+
+const Store = pickExport('WorkBuddyCredentialStore', 'C');
+const Client = pickExport('WorkBuddyUpstreamClient', 'V');
+const FALLBACK_MODELS = pickExport('FALLBACK_WORKBUDDY_MODELS', 'p') || [];        // 国内
+const FALLBACK_MODELS_GLOBAL = pickExport('FALLBACK_WORKBUDDY_MODELS_GLOBAL', 'm') || []; // 国际
+const workbuddyAccountId = pickExport('workbuddyAccountId', 'F');
 
 // ⚠️ 反风控：直接复用插件自己的请求体整形 / 指纹扰动函数。
 // 上游两个网关都有一道「通道校验」闸门：system 消息如果以未批准的身份短语开头
@@ -88,15 +143,35 @@ const FALLBACK_MODELS_GLOBAL = mod.m || []; // 国际
 //   ⑤ 身份子句插零宽空格打断    ⑥ tool_choice 展平成字符串
 //   ⑦ 对拒绝 off 档位的模型剔掉 reasoning_effort
 // 直接用它的函数，插件一升级这边自动跟上，比自己抄一份更安全。
-const prepareChatBody = mod.rt;              // 请求体整形
-const perturbChannelFingerprints = mod.nt;   // 11128 时的零宽扰动重试
+const prepareChatBody = pickExport('prepareChatBody', 'rt');                          // 请求体整形
+const perturbChannelFingerprints = pickExport('perturbChannelFingerprints', 'nt');    // 11128 时的零宽扰动重试
+const isCredentialRejectedError = pickExport('isCredentialRejectedError', 'ct');      // 401/403 的分类器
 
-if (!Store || !Client) throw new Error('插件导出结构变了，请更新本脚本');
-if (typeof prepareChatBody !== 'function') {
-  console.warn('⚠ 插件没有导出 prepareChatBody(mod.rt)，将在裸透传模式下运行（风控风险更高）');
+/** 这个异常是不是「凭据被上游拒绝」（该重新登录，不是网络问题）。 */
+function isCredentialRejected(e) {
+  if (!e) return false;
+  if (typeof isCredentialRejectedError === 'function') {
+    try { if (isCredentialRejectedError(e)) return true; } catch { /* ignore */ }
+  }
+  const status = Number(e.status ?? e.statusCode ?? 0);
+  if (status === 401 || status === 403) return true;
+  return /401|403|credential rejected|unauthori[sz]ed/i.test(String(e.message || ''));
 }
 
-const upstream = new Client();
+if (!Store || !Client) {
+  throw new Error(
+    `host-heartbeat 导出结构变了：找不到 WorkBuddyCredentialStore / WorkBuddyUpstreamClient\n` +
+    `（解析到的原始导出名共 ${ALIASES.size} 个，文件：${path.basename(hbPath)}）`
+  );
+}
+if (typeof prepareChatBody !== 'function') {
+  console.warn('⚠ 插件没有导出 prepareChatBody，将在裸透传模式下运行（风控风险更高）');
+}
+
+// 第二个参数是 identity（wire profile）。不传时上游默认 balanced —— 与官方客户端
+// 一致的归属头（X-Product/X-IDE-* 同值）＋ 派生设备 id 对（X-Machine-ID /
+// X-Session-ID）。这是 5.16 之后上游对抗风控的主要手段，跟着默认值走。
+const upstream = new Client((msg) => log('[upstream]', msg), {}, {});
 
 // ── 凭据存储目录 ──────────────────────────────────────────────────────────
 // 默认落在扩展自己的存储目录（由扩展通过 WB_VAULT_DIR 传入），
@@ -119,6 +194,80 @@ if (VAULT_ROOT) {
   for (const r of ['cn', 'global']) {
     try { fs.mkdirSync(vaultDirFor(r), { recursive: true }); } catch { /* ignore */ }
   }
+}
+
+// ── 旧 vault 账号导入 ─────────────────────────────────────────────────────
+// 扩展只用自己 globalStorage 下的 vault（卸载即清理）。但用户在装本扩展之前
+// 可能已经用别的方式登录过账号（DSH 插件、或别的工具写的 ~/.dsh vault），
+// 那些账号在扩展里就"少一个"。
+//
+// 这里的策略：**只读旧目录、只补齐缺失项**，补齐后所有读写都走扩展自己的
+// vault。不删旧文件，不动别的工具的数据。
+function legacyVaultDirFor(region) {
+  // ⚠️ 用 REAL_DSH_HOME，不是 process.env.DSH_HOME —— 后者已经被我们改指向
+  // 扩展自己的目录了，再拿它去找旧账号会永远找不到。
+  const dir = path.join(REAL_DSH_HOME, 'workbuddy-vault', region);
+  const own = vaultDirFor(region);
+  // 手动运行（没设 WB_VAULT_DIR）时两者是同一个目录，不需要导入
+  if (!own || path.resolve(dir) === path.resolve(own)) return '';
+  return dir;
+}
+
+function readVaultDoc(file) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!j || typeof j !== 'object') return null;
+    if (!j.auth?.accessToken || !j.account?.uid) return null;
+    return j;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把旧 vault 里、扩展 vault 里没有的账号复制过来。
+ * @returns {{imported:string[], skipped:number}}
+ */
+function importLegacyAccounts(region = 'cn') {
+  const legacy = legacyVaultDirFor(region);
+  const own = vaultDirFor(region);
+  const out = { imported: [], skipped: 0 };
+  if (!legacy || !own) return out;
+
+  let files = [];
+  try {
+    files = fs.readdirSync(legacy).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
+  } catch {
+    return out; // 没有旧目录，正常
+  }
+
+  for (const name of files) {
+    const target = path.join(own, name);
+    try {
+      if (fs.existsSync(target)) { out.skipped++; continue; }
+    } catch { continue; }
+
+    const doc = readVaultDoc(path.join(legacy, name));
+    if (!doc) { out.skipped++; continue; }
+
+    try {
+      const tmp = `${target}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
+      fs.renameSync(tmp, target);
+      out.imported.push(doc.account.nickname || doc.accountId || name);
+    } catch (e) {
+      log(`导入旧账号 ${name} 失败：${e?.message || e}`);
+      out.skipped++;
+    }
+  }
+
+  if (out.imported.length) {
+    // 账号池缓存作废，让接下来的 /accounts 立刻看到新账号
+    pool[region].loadedAt = 0;
+    stores[region].invalidateScan?.();
+    log(`[${region}] 已从旧 vault 导入 ${out.imported.length} 个账号：${out.imported.join('、')}`);
+  }
+  return out;
 }
 
 // ── Token 缓存 ────────────────────────────────────────────────────────────
@@ -172,6 +321,9 @@ async function listAccounts(region = 'cn') {
   const p = pool[region];
   if (p.accounts.length && Date.now() - p.loadedAt < POOL_TTL_MS) return p.accounts;
 
+  // 每次重新扫描前补齐旧 vault 的账号：用户可能在别的工具里刚加过账号
+  try { importLegacyAccounts(region); } catch { /* 导入失败不影响列表 */ }
+
   const list = await stores[region].accounts();
   p.accounts = list;
   p.loadedAt = Date.now();
@@ -197,7 +349,7 @@ async function credForAccount(accountId, region = 'cn') {
     try {
       cred = await stores[region].refreshNow(cred);
     } catch (e) {
-      log(`账号 ${accountId} 刷新失败：${e?.message || e}`);
+      log(`账号 ${accountId} 刷新失败：${whyFetchFailed(e)}`);
       return null;
     }
   }
@@ -321,7 +473,44 @@ async function refreshCredFor(accountId, region, cred) {
     pool[region].tokens.set(accountId, next);
     return next;
   } catch (e) {
-    log(`账号 ${accountId} 刷新失败：${e?.message || e}`);
+    log(`账号 ${accountId} 刷新失败：${whyFetchFailed(e)}`);
+    return null;
+  }
+}
+
+/** 上游 fetchCheckinStatus() 的返回 → 我们内部统一的形状。 */
+function normalizeUpstreamStatus(s) {
+  if (!s || typeof s !== 'object') return null;
+  return {
+    ok: true,
+    active: s.active !== false,
+    checkedIn: s.todayCheckedIn === true,
+    streakDays: Number(s.streakDays ?? 0),
+    totalCredits: Number(s.totalCredits ?? 0),
+    todayCredit: Number(s.todayCredit ?? 0),
+    isStreakDay: s.isStreakDay === true,
+    activityName: typeof s.activityName === 'string' ? s.activityName : '',
+  };
+}
+
+/** 上游 fetchCheckinStatus() 失败时，刷新一次 token 再试。 */
+async function tryUpstreamStatus(cred, accountId, region) {
+  if (typeof upstream.fetchCheckinStatus !== 'function') return null;
+  try {
+    return normalizeUpstreamStatus(await upstream.fetchCheckinStatus(cred));
+  } catch (e) {
+    if (isCredentialRejected(e)) {
+      const next = await refreshCredFor(accountId, region, cred);
+      if (next) {
+        try {
+          return normalizeUpstreamStatus(await upstream.fetchCheckinStatus(next));
+        } catch (e2) {
+          log(`签到状态查询失败（${accountId}）：${e2?.message || e2}`);
+          return null;
+        }
+      }
+    }
+    log(`签到状态查询失败（${accountId}），改用自己的实现：${e?.message || e}`);
     return null;
   }
 }
@@ -329,6 +518,10 @@ async function refreshCredFor(accountId, region, cred) {
 async function checkinStatusFor(accountId, region = 'cn') {
   let cred = await credForAccount(accountId, region);
   if (!cred) return { ok: false, error: 'AUTH', message: '凭据不可用' };
+
+  // 优先用模块自带的实现：它的 billing 头带完整 wire identity，和官方客户端一致
+  const native = await tryUpstreamStatus(cred, accountId, region);
+  if (native) return native;
 
   let { http, body } = await callCheckinEndpoint(cred, '/v2/billing/meter/checkin-activity-status');
   if (http === 401 || http === 403) {
@@ -353,6 +546,45 @@ async function checkinStatusFor(accountId, region = 'cn') {
 async function checkinFor(accountId, region = 'cn') {
   let cred = await credForAccount(accountId, region);
   if (!cred) return { result: 'AUTH', message: '凭据不可用' };
+
+  // ① 优先用模块自带的 claimDailyCheckin()（同样的 billing 头 + wire identity）
+  if (typeof upstream.claimDailyCheckin === 'function') {
+    let native = null;
+    try {
+      native = await upstream.claimDailyCheckin(cred);
+    } catch (e) {
+      if (isCredentialRejected(e)) {
+        const next = await refreshCredFor(accountId, region, cred);
+        if (next) {
+          cred = next;
+          try { native = await upstream.claimDailyCheckin(cred); } catch (e2) { native = { __error: e2 }; }
+        } else {
+          return { result: 'AUTH', message: '登录已失效，请重新登录账号' };
+        }
+      } else if (/已签|10001/.test(String(e?.message || ''))) {
+        const st = await checkinStatusFor(accountId, region).catch(() => null);
+        return { result: 'ALREADY', message: '今日已签', ...(st?.ok ? { status: st } : {}) };
+      } else {
+        native = { __error: e };
+      }
+    }
+
+    if (native && !native.__error) {
+      const st = await checkinStatusFor(accountId, region).catch(() => null);
+      const credit = Number(native.credit ?? 0);
+      return {
+        result: 'CLAIMED',
+        credit: Number.isFinite(credit) && credit > 0 ? credit : undefined,
+        message: Number.isFinite(credit) && credit > 0 ? `签到成功 +${credit} 积分` : '签到成功',
+        ...(st?.ok ? { status: st } : {}),
+      };
+    }
+    if (native?.__error) {
+      log(`上游 claimDailyCheckin 失败（${accountId}），改用自己的实现：${native.__error?.message || native.__error}`);
+      // 重新读一次凭据：上面可能刚刷新过
+      cred = (await credForAccount(accountId, region)) || cred;
+    }
+  }
 
   let { http, body } = await callCheckinEndpoint(cred, '/v2/billing/meter/daily-checkin');
   if (http === 401 || http === 403) {
@@ -395,15 +627,60 @@ async function checkinFor(accountId, region = 'cn') {
   };
 }
 
-/** 用指定凭据发一次 chat 请求（body 必须是已整形的 JSON 字符串） */
-function fetchChat(cred, bodyJson) {
+/** 旧路径：自己拼头。只在模块没导出 chatStream 时兜底。 */
+function fetchChatRaw(cred, bodyJson, signal) {
   const base = chatBaseOf(cred);
   return fetch(`${base}/v2/chat/completions`, {
     method: 'POST',
     headers: chatHeaders(cred),
     body: bodyJson,
+    ...(signal ? { signal } : {}),
   });
 }
+
+/**
+ * 发一次 chat 请求。
+ *
+ * 优先走模块的 `chatStream()` —— 它带 wire identity（设备/归属头），
+ * 并会把失败体分类成 kind（session_dead / hard_credit / channel_reject…）。
+ * 失败时合成一个 Response 回来，这样调用方的 `res.ok / res.status / res.text()`
+ * 全都不用改。
+ */
+async function fetchChat(cred, bodyJson, signal) {
+  if (typeof upstream.chatStream !== 'function') {
+    return fetchChatRaw(cred, bodyJson, signal);
+  }
+  const r = await upstream.chatStream(cred, bodyJson, signal);
+  if (r?.response) {
+    if (r.kind) r.response.wbKind = r.kind;
+    return r.response;
+  }
+  const status = Number(r?.status) > 0 ? Number(r.status) : 502;
+  const res = new Response(String(r?.message ?? 'upstream unavailable'), {
+    status,
+    headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+  res.wbKind = r?.kind || 'server';
+  return res;
+}
+
+/** 上游的失败分类 → 给人看的一句话。 */
+const KIND_MESSAGE = {
+  hard_credit: '积分已用尽',
+  session_dead: '登录已失效',
+  account_restricted: '账号被限制',
+  policy_reject: '内容被安全策略拒绝',
+  channel_reject: '通道校验失败（11128）',
+  model_busy: '模型繁忙，请稍后重试',
+  model_queue: '模型排队中，请稍后重试',
+  soft_rate: '请求过于频繁，请稍后重试',
+  not_found: '模型不存在',
+  server: '上游服务异常',
+  client: '请求被上游拒绝',
+};
+
+/** 这些分类说明「这把凭据不行了」，应当触发重新登录。 */
+const DEAD_KINDS = new Set(['session_dead', 'account_restricted']);
 
 // ── 账号分组（模型 id 里编码账号）──────────────────────────────────────────
 // 不轮询。默认用「当前账号」——和插件完全一致，即 WorkBuddyCredentialStore.current()
@@ -431,8 +708,8 @@ async function pickCurrentAccount(region, accounts) {
   if (!accounts.length) return null;
   try {
     const cur = await stores[region].current();
-    if (cur && typeof mod.F === 'function') {
-      const id = mod.F(cur);
+    if (cur && typeof workbuddyAccountId === 'function') {
+      const id = workbuddyAccountId(cur);
       const hit = accounts.find((a) => a.id === id);
       if (hit) return hit;
     }
@@ -656,6 +933,28 @@ function log(...a) {
   console.log(`[${t}]`, ...a);
 }
 
+/** 这个异常是不是「网络不通」（区别于 401 之类的鉴权问题）。 */
+function isNetworkError(e) {
+  const c = e?.cause;
+  const code = String(c?.code || '');
+  if (/^(ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|UND_ERR)/.test(code)) return true;
+  return /fetch failed|network|socket hang up|timeout/i.test(String(e?.message || ''));
+}
+
+/**
+ * 把 fetch 的 `TypeError: fetch failed` 展开成能定位的形式。
+ * 裸的 "fetch failed" 分不清是 DNS、TLS、连接被重置还是超时，
+ * 而排查时这几个的处置方式完全不同。
+ */
+function whyFetchFailed(e) {
+  if (!e) return '';
+  const base = String(e.message || e);
+  const c = e.cause;
+  if (!c) return base;
+  const bits = [c.code, c.message].filter((x) => typeof x === 'string' && x && x !== base);
+  return bits.length ? `${base} ← ${[...new Set(bits)].join(' / ')}` : base;
+}
+
 // ── 模型别名兜底 ──────────────────────────────────────────────────────────
 // 上游对未知模型返回 {"code":11102,"msg":"model [xxx] service info not found"}，
 // 而 VS Code 扩展会把它显示成「请求体格式错误」—— 极误导。
@@ -788,7 +1087,7 @@ async function refreshModelIds(region = 'cn') {
     }
     log('目录解析为空，退回该区域内置常量');
   } catch (e) {
-    log(`模型目录异常：${e?.message || e}`);
+    log(`模型目录异常：${whyFetchFailed(e)}`);
   }
   return false;
 }
@@ -823,8 +1122,7 @@ async function verifyModels(region = 'cn') {
   const probe = async (id) => {
     try {
       const cred = await getCred(region);
-      const base = chatBaseOf(cred);
-      // 和正式请求走同一套整形，保持一致
+      // 和正式请求走同一套整形 + 同一套头（含 wire identity），保持一致
       const probeSrc = JSON.stringify({
         model: id,
         messages: [{ role: 'user', content: '在' }],
@@ -832,12 +1130,14 @@ async function verifyModels(region = 'cn') {
         max_tokens: 8,
       });
       const probeBody = typeof prepareChatBody === 'function' ? prepareChatBody(probeSrc, {}) : probeSrc;
-      const res = await fetch(`${base}/v2/chat/completions`, {
-        method: 'POST',
-        headers: chatHeaders(cred),
-        body: probeBody,
-        signal: AbortSignal.timeout(45_000),
-      });
+      // 优先用模块自带的 probeChat（自己管超时，且和 chatStream 共用头）
+      if (typeof upstream.probeChat === 'function') {
+        const r = await upstream.probeChat(cred, probeBody, AbortSignal.timeout(45_000));
+        if (r?.ok) { ok.add(id); try { await r.response?.body?.cancel(); } catch { /* ignore */ } }
+        else bad.push(id);
+        return;
+      }
+      const res = await fetchChatRaw(cred, probeBody, AbortSignal.timeout(45_000));
       if (res.ok) { ok.add(id); try { await res.body?.cancel(); } catch { /* ignore */ } }
       else bad.push(id);
     } catch {
@@ -1112,8 +1412,8 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
 
       lastRes = res;
 
-      // 401 → 刷新这个账号的 token 再试一次
-      if (res.status === 401 && same === 0) {
+      // 401/403 或分类为「凭据已死」→ 刷新这个账号的 token 再试一次
+      if ((res.status === 401 || DEAD_KINDS.has(res.wbKind)) && same === 0) {
         log(`账号「${acct.accountName}」401，刷新 token 后重试`);
         p.tokens.delete(acct.id);
         try {
@@ -1387,8 +1687,10 @@ const server = http.createServer(async (req, res) => {
         const credits = await creditsFor(accountId, region, force);
         return send(res, 200, { ok: true, region, accountId, accountName, ...credits });
       } catch (e) {
-        log('GET /credits 失败：', e?.message || e);
-        return send(res, 502, { error: { message: String(e?.message || e) } });
+        log('GET /credits 失败：', whyFetchFailed(e));
+        return send(res, 502, {
+          error: { message: whyFetchFailed(e), kind: isNetworkError(e) ? 'NETWORK' : undefined },
+        });
       }
     }
 
@@ -1441,6 +1743,13 @@ const server = http.createServer(async (req, res) => {
 
       log(`签到：${results.map((r) => `${r.name}:${r.result}`).join('  ') || '(没有账号)'}`);
       return send(res, 200, { ok: true, region, at: new Date().toISOString(), results });
+    }
+
+    // 补齐旧 vault 里的账号（启动时已自动跑一次，这个端点用于手动重试）
+    if (p === '/accounts/import' && req.method === 'POST') {
+      const region = u.searchParams.get('region') === 'global' ? 'global' : 'cn';
+      const r = importLegacyAccounts(region);
+      return send(res, 200, { ok: true, region, ...r });
     }
 
     // 手动切换当前账号（内存态；不落盘，重启代理后回到桌面端选中的那个）
@@ -1609,9 +1918,17 @@ const server = http.createServer(async (req, res) => {
       const up = await callUpstream(body, region);
       if (!up.ok) {
         const txt = await up.text();
-        log(`✗ 上游 ${up.status} ${((Date.now() - t0) / 1000).toFixed(1)}s — ${txt.slice(0, 200)}`);
-        return send(res, up.status, {
-          error: { message: `WorkBuddy upstream ${up.status}`, type: 'upstream_error', detail: txt.slice(0, 2000) },
+        const kind = up.wbKind || '';
+        const friendly = KIND_MESSAGE[kind];
+        // 分类为「凭据已死」时统一报 401，扩展那边才会给出「重新登录」的指引
+        const status = DEAD_KINDS.has(kind) ? 401 : up.status;
+        log(`✗ 上游 ${up.status}${kind ? ` [${kind}]` : ''} ${((Date.now() - t0) / 1000).toFixed(1)}s — ${txt.slice(0, 200)}`);
+        return send(res, status, {
+          error: {
+            message: friendly ? `${friendly}（HTTP ${up.status}）` : `WorkBuddy upstream ${up.status}`,
+            type: kind || 'upstream_error',
+            detail: txt.slice(0, 2000),
+          },
         });
       }
 
@@ -1633,7 +1950,7 @@ const server = http.createServer(async (req, res) => {
             n++;
           }
         } catch (e) {
-          log('流中断：', e?.message || e);
+          log('流中断：', whyFetchFailed(e));
         }
         res.end();
         log(`✓ 流式 ${body.model} ${n} chunk ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -1666,9 +1983,22 @@ server.listen(PORT, '127.0.0.1', async () => {
   console.log(`WorkBuddy 代理已启动  http://127.0.0.1:${actualPort}`);
   console.log(`  模块   : ${path.basename(hbPath)}`);
   console.log(`  鉴权   : ${AUTH_TOKEN ? '已启用（进程内随机 token）' : '未启用（手动启动模式）'}`);
+  console.log(`  数据   : ${PRIVATE_DSH_HOME || REAL_DSH_HOME}${PRIVATE_DSH_HOME ? '（扩展私有）' : ''}`);
   console.log(`  端点   : POST /v1/chat/completions`);
   console.log(`  模型   : GET /v1/models`);
   console.log(`  健康   : GET /health`);
+
+  // 先把旧 vault 里缺失的账号补进来，否则账号数会比实际少。
+  // 必须在 getCred() 之前：扩展 vault 为空、旧 vault 有账号时也要能补上。
+  for (const r of ['cn', 'global']) {
+    try {
+      const r2 = importLegacyAccounts(r);
+      if (r2.imported.length) console.log(`  导入   : ${r2.imported.join(' / ')}（来自旧 vault）`);
+    } catch (e) {
+      console.log(`  ⚠ 导入旧 vault 账号失败（${r}）：${e?.message || e}`);
+    }
+  }
+
   try {
     const cred = await getCred('cn');
     // 区域以凭据里的 domain 为准（国内账号的 domain 是 www.codebuddy.cn）

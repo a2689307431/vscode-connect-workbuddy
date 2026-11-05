@@ -7,6 +7,7 @@ proxy/PROXY.md
 
 # 测试与临时脚本
 proxy/tests/**
+scripts/**
 _test-*.mjs
 _rename.mjs
 
