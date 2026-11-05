@@ -1067,7 +1067,8 @@ function estimateTokens(text) {
 let thinkingSupported = null;
 
 function reportThinking(progress, text, runId) {
-  if (!text) return;
+  // 兜底：只有空白的「思考」是上游噪音，别在界面上留空块
+  if (!text || !text.trim()) return;
   if (thinkingSupported === null) {
     thinkingSupported = typeof vscode.LanguageModelThinkingPart === 'function';
     log('LanguageModelThinkingPart 运行时可用：', thinkingSupported);
@@ -1251,12 +1252,22 @@ class WorkBuddyProvider {
       //
       // 权衡：攒批会让思考显示略微滞后（80 字符 ≈ 20~40 个字）。调小 → 更实时但
       // part 更多；调大 → part 更少但更迟钝。80 是实测下来既连续又够及时的值。
+      //
+      // ⚠️ 必须过滤纯空白（2026-11-06 从 chatSessions/*.jsonl 取证）：
+      //    WorkBuddy 大多数模型的 reasoning_content 只返回空格和换行，真正的
+      //    思考（如果有）混在 content 里。不过滤的话每个工具调用前都会多出一个
+      //    「内容只有一个空格」的思考块，界面上全是噪音。
       const THINK_FLUSH_CHARS = 80;
       let reasoningRunId;
       let reasoningBuf = '';
 
       const flushThinking = () => {
-        if (!reasoningBuf) return;
+        // 整段都是空白就丢弃（上游常有这种），否则原样上报 ——
+        // 不能逐块 trim，否则英文单词会被粘在一起（"the " + "cat" → "thecat"）。
+        if (!reasoningBuf.trim()) {
+          reasoningBuf = '';
+          return;
+        }
         reasoningRunId ??= crypto.randomUUID();
         reportThinking(progress, reasoningBuf, reasoningRunId);
         reasoningBuf = '';
