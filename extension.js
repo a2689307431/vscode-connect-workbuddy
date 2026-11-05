@@ -551,29 +551,64 @@ function trackAccount(accountId, { force = false } = {}) {
 // 所以「每个账号一组」只能靠往那个文件里写条目，扩展没法凭空创建分组。
 //
 // 文件位置（VS Code 内部叫 currentProfile.languageModelsResource）：
-//   Windows  %APPDATA%\Code\User\chatLanguageModels.json
-//   macOS    ~/Library/Application Support/Code/User/chatLanguageModels.json
-//   Linux    ~/.config/Code/User/chatLanguageModels.json
-// 也支持 --user-data-dir 指定的目录，所以优先用 context.globalStorageUri 反推。
+//   Windows  %APPDATA%\<变体>\User\chatLanguageModels.json
+//   macOS    ~/Library/Application Support/<变体>/User/chatLanguageModels.json
+//   Linux    ~/.config/<变体>/User/chatLanguageModels.json
+// 变体：Code（稳定版）/ Code - Insiders / VSCodium / Cursor …
+// 也支持 --user-data-dir 指定的目录，所以优先用 context 给的 URI 反推。
 const GROUP_PREFIX = 'WorkBuddy';
 
+/**
+ * 用户数据目录名（<userDataDir> 的最后一段）。
+ * 只有在拿不到任何 context URI 时才用得到 —— 写死 "Code" 会让
+ * Insiders / VSCodium / Cursor 写到错误目录。
+ */
+function userDataDirName() {
+  const app = String(vscode.env?.appName || '');
+  if (/insider/i.test(app)) return 'Code - Insiders';
+  if (/vscodium/i.test(app)) return 'VSCodium';
+  if (/cursor/i.test(app)) return 'Cursor';
+  if (/windsurf/i.test(app)) return 'Windsurf';
+  if (/codium/i.test(app)) return 'VSCodium';
+  return 'Code';
+}
+
 function modelsConfigPath(context) {
-  // globalStorageUri: <userDataDir>/globalStorage/<extId>
-  //   → <userDataDir>/chatLanguageModels.json
+  // ① 首选：globalStorageUri = <userDataDir>/globalStorage/<extId>
   try {
     const gs = context.globalStorageUri?.fsPath;
     if (gs) {
       const userDir = path.dirname(path.dirname(gs));
       return path.join(userDir, 'chatLanguageModels.json');
     }
-  } catch { /* 落到下面的兜底 */ }
+  } catch { /* 继续下一个来源 */ }
 
+  // ② 次选：从 logUri 往上找到名为 logs 的那层，它的父目录就是 userDataDir
+  //    logUri 形如 <userDataDir>/logs/<会话>/window1/exthost/<扩展名>，
+  //    层数可能随版本变，所以按名字找而不是数层数。
+  try {
+    let cur = context.logUri?.fsPath;
+    for (let depth = 0; cur && depth < 6; depth++) {
+      const parent = path.dirname(cur);
+      if (path.basename(cur) === 'logs') {
+        // ⚠️ 不能返回 <userDataDir>/chatLanguageModels.json ——
+        //    真实位置是 <userDataDir>/User/chatLanguageModels.json
+        return path.join(parent, 'User', 'chatLanguageModels.json');
+      }
+      if (parent === cur) break;
+      cur = parent;
+    }
+  } catch { /* 继续 */ }
+
+  // ③ 兜底：按平台约定 + 变体名拼
   const appData = process.env.APPDATA
     || (process.env.HOME ? path.join(process.env.HOME, '.config') : '');
   const base = process.platform === 'darwin'
     ? (process.env.HOME ? path.join(process.env.HOME, 'Library', 'Application Support') : '')
     : appData;
-  return base ? path.join(base, 'Code', 'User', 'chatLanguageModels.json') : '';
+  return base
+    ? path.join(base, userDataDirName(), 'User', 'chatLanguageModels.json')
+    : '';
 }
 
 /** 读 chatLanguageModels.json；文件不存在/坏了都返回空数组。 */
@@ -1021,15 +1056,17 @@ function estimateTokens(text) {
 // 用途：把上游 delta.reasoning_content 显示成 Copilot Chat 里可折叠的「思考」块。
 // 参考实现：vizards.deepseek-v4-for-copilot 的 provider/stream.js → handleThinking()。
 //
-// ⚠️ 现状（2026-11-01 实测）：WorkBuddy 的 deepseek-v4.1-flash 虽然声明
-//    `supportsReasoning: true` / `onlyReasoning: true`，但上游 SSE 里
-//    `reasoning_content` 字段**恒为空字符串**，推理过程全部混在 `content` 里。
-//    所以这里的代码对当前模型不会产生可见变化，但：
-//      - 换成别的模型（glm / kimi 等，若上游改为返回）时自动生效
-//      - 无副作用：拿不到内容就什么都不报
+// 两条硬要求（2026-11-05 与官方 API 对照实测，缺任一条界面上就是一串
+// 「Thought for 1s」碎片而不是一整块）：
+//   1. 同一轮连续思考的所有 part 必须带**同一个 id**（正文 / 工具调用打断后清空，
+//      下一段思考才另起一块）。参照做法：
+//        state.reasoningRunId ??= randomUUID();
+//        progress.report(new LanguageModelThinkingPart(text, state.reasoningRunId));
+//   2. 上游把 reasoning_content 拆成 1~4 字符的碎片，攒到几十字符再上报，
+//      否则一次回答会生成几十个 part。
 let thinkingSupported = null;
 
-function reportThinking(progress, text) {
+function reportThinking(progress, text, runId) {
   if (!text) return;
   if (thinkingSupported === null) {
     thinkingSupported = typeof vscode.LanguageModelThinkingPart === 'function';
@@ -1037,7 +1074,7 @@ function reportThinking(progress, text) {
   }
   if (!thinkingSupported) return;
   try {
-    progress.report(new vscode.LanguageModelThinkingPart(text));
+    progress.report(new vscode.LanguageModelThinkingPart(text, runId));
   } catch (e) {
     thinkingSupported = false;
     log('ThinkingPart 上报失败，本次起禁用：', e?.message || e);
@@ -1207,6 +1244,29 @@ class WorkBuddyProvider {
       let reasoningChars = 0;
       let contentChars = 0;
 
+      // ── 思考批处理 ──────────────────────────────────────────────
+      // 上游把 reasoning_content 拆成 1~4 字符的碎片（实测一次回答 121 个 delta），
+      // 逐条上报会让 Copilot Chat 渲染成一长串「Thought for 1s」。
+      // 这里先攒够 THINK_FLUSH_CHARS 再上报，一轮连续思考共用一个 runId。
+      //
+      // 权衡：攒批会让思考显示略微滞后（80 字符 ≈ 20~40 个字）。调小 → 更实时但
+      // part 更多；调大 → part 更少但更迟钝。80 是实测下来既连续又够及时的值。
+      const THINK_FLUSH_CHARS = 80;
+      let reasoningRunId;
+      let reasoningBuf = '';
+
+      const flushThinking = () => {
+        if (!reasoningBuf) return;
+        reasoningRunId ??= crypto.randomUUID();
+        reportThinking(progress, reasoningBuf, reasoningRunId);
+        reasoningBuf = '';
+      };
+      // 思考结束：先把尾巴发完，再清掉 runId，下一段思考才会另起一块
+      const endThinkingRun = () => {
+        flushThinking();
+        reasoningRunId = undefined;
+      };
+
       for await (const chunk of readSSE(res.body)) {
         if (token.isCancellationRequested) break;
 
@@ -1214,18 +1274,24 @@ class WorkBuddyProvider {
         if (choice) {
           const delta = choice.delta || {};
 
-          // 思考内容（上游若返回才显示；当前 WorkBuddy 多数模型返回空串）
+          // 思考内容：攒批上报，runId 在一轮内保持不变
           if (delta.reasoning_content) {
             reasoningChars += delta.reasoning_content.length;
-            reportThinking(progress, delta.reasoning_content);
+            reasoningBuf += delta.reasoning_content;
+            if (reasoningBuf.length >= THINK_FLUSH_CHARS) flushThinking();
           }
 
           if (delta.content) {
+            endThinkingRun();
             contentChars += delta.content.length;
             progress.report(new vscode.LanguageModelTextPart(delta.content));
           }
 
-          if (Array.isArray(delta.tool_calls)) {
+          // ⚠️ 必须判 length：上游每个 chunk 都带 `tool_calls: []`，
+          //    只判 isArray 会在每个 delta 触发 endThinkingRun()，
+          //    把思考流切成 1~10 字符的碎片（2026-11-05 取证日志确认）。
+          if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+            endThinkingRun();
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;
               let cur = pendingToolCalls.get(idx);
@@ -1240,6 +1306,7 @@ class WorkBuddyProvider {
           }
 
           if (choice.finish_reason) {
+            endThinkingRun();
             // 收尾时把累积的工具调用一次性发出
             for (const [idx, tc] of pendingToolCalls) {
               let input = {};
@@ -1254,6 +1321,8 @@ class WorkBuddyProvider {
           }
         }
       }
+
+      endThinkingRun();
 
       if (token.isCancellationRequested) log('已取消');
       else log(`完成：正文 ${contentChars} 字符，思考 ${reasoningChars} 字符`);
