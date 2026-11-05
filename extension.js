@@ -145,7 +145,8 @@ async function ensureProxy(context) {
   const realDshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
   for (const d of [vaultDir, dshHome]) {
     try {
-      fs.mkdirSync(d, { recursive: true });
+      // POSIX 上收紧到 0700：里面是凭据和设备盐
+      fs.mkdirSync(d, { recursive: true, mode: 0o700 });
     } catch { /* ignore */ }
   }
 
@@ -1283,7 +1284,8 @@ async function activate(context) {
     await ensureProxy(context);
   } catch (e) {
     output.appendLine('⚠ 自动拉起代理失败：' + (e?.message || e));
-    output.appendLine('  可手动启动：proxy\\启动 WorkBuddy 代理.bat');
+    // 不要写死 .bat —— Linux / macOS 上没有这个文件
+    output.appendLine('  排查：确认 node 可用（设置 connect-workbuddy.nodePath），或查看 README 的故障排查。');
     proxyState.url = DEFAULT_PROXY_URL;
     proxyState.child = null;
   }

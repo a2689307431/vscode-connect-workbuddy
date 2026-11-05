@@ -37,6 +37,8 @@ if (PRIVATE_DSH_HOME) {
     const legacy = path.join(REAL_DSH_HOME, '.workbuddy-device.json');
     if (!fs.existsSync(own) && fs.existsSync(legacy)) {
       fs.copyFileSync(legacy, own);
+      // copyFileSync 会沿用源文件权限；显式收一下，避免 umask 影响
+      try { fs.chmodSync(own, 0o600); } catch { /* Windows 上无意义 */ }
     }
   } catch { /* ignore */ }
 
@@ -252,7 +254,8 @@ function importLegacyAccounts(region = 'cn') {
 
     try {
       const tmp = `${target}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
+      // 凭据是明文 token：POSIX 上建成 0600，别默认跟着 umask 走成 0644
+      fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, target);
       out.imported.push(doc.account.nickname || doc.accountId || name);
     } catch (e) {
