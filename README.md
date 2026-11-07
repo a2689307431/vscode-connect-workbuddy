@@ -1,12 +1,9 @@
 # Connect WorkBuddy
 
-**把 WorkBuddy（CodeBuddy）的模型，接进 VS Code Copilot Chat 的模型下拉框。**
+把 **WorkBuddy / CodeBuddy** 的模型，接进 **VS Code Copilot Chat** 的模型下拉框 ——
+和 GPT、Claude 等自带模型并列，直接切，不用换面板。
 
-> WorkBuddy · CodeBuddy · 腾讯 Copilot · VS Code · Copilot Chat ·
-> `languageModelChatProviders` · DeepSeek · GLM · Kimi · 多账号 · 积分查询 · 每日签到
-
-装好扩展、登录一次，模型选择器里就会多出 WorkBuddy 的模型，
-和你已有的 Copilot 模型放在同一个下拉框里 —— 直接切，不用换界面。
+装好扩展、登录一次，模型选择器里就会多出 WorkBuddy 的模型。
 不用起服务、不用记端口、不用填 base_url、不用手输模型名。
 
 ```
@@ -613,3 +610,17 @@ node --check proxy/workbuddy-proxy.mjs
 
 内嵌的第三方模块遵循其原始 MIT 许可，版权与许可声明见
 [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md)。
+
+---
+
+<sub>
+
+**关键词**：WorkBuddy · CodeBuddy · 腾讯 Copilot · CodeBuddy 插件 · VS Code ·
+Visual Studio Code · Copilot Chat · GitHub Copilot · 模型下拉框 · 自定义模型 ·
+`languageModelChatProviders` · Language Model Chat Provider · BYOK · Bring Your Own Key ·
+DeepSeek V4 · DeepSeek-V4.1-Flash · GLM · Kimi · MiniMax · 混元 ·
+多账号 · 多账号切换 · 额度查看 · 剩余积分 · 每日签到 · 自动签到 ·
+VS Code 扩展 · VS Code extension · Windows · macOS · Linux ·
+非官方 · unofficial · 学习研究
+
+</sub>
