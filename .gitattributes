@@ -1,0 +1,27 @@
+# 统一换行符，避免 Windows 上 checkout 后 sha256 变化
+#
+# ⚠️ 规则按顺序生效，后写的会覆盖先写的。所以 lib/ 的特殊规则必须放在最后。
+
+# 源码统一 LF
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# 二进制
+*.vsix  binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+
+# ── 必须放最后 ──────────────────────────────────────────────────
+# lib/ 下的模块是上游的原样快照，sha256 记录在 lib/package.json 里。
+# 如果 Windows 上被 autocrlf 转成 CRLF，校验就会失败 —— 用户拿到的是
+# 「校验不过」的包，看起来像被篡改过。
+#
+# 用 eol=lf 而不是 -text / binary：
+#   · eol=lf 保证检出时是 LF，仍按文本处理（diff 可读）
+#   · binary 会让 git 完全不管换行，源文件是 CRLF 时反而保持 CRLF
+lib/** text eol=lf
