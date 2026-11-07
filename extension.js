@@ -68,28 +68,79 @@ function findProxyScript(extensionPath) {
   return '';
 }
 
+// 代理和上游模块都用到了这两个特性，低于这个版本会在 import 阶段就崩：
+//   · 内置 fetch            → Node 18.0
+//   · AbortSignal.timeout() → Node 17.3
+// Ubuntu 22.04 自带的 node 是 12、Debian 11 是 12、macOS 上 nvm 可能装着很老的版本，
+// 所以**必须逐版本校验**，不能「找到 node 就用」。
+const MIN_NODE_MAJOR = 18;
+
+/** 取一个 node 可执行文件的主版本号；拿不到就返回 0。 */
+function nodeMajorVersion(cmd, env) {
+  try {
+    const out = execFileSync(cmd, ['-v'], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 3000,
+      env: env ? { ...process.env, ...env } : process.env,
+    });
+    const m = /v(\d+)\./.exec(String(out));
+    return m ? Number(m[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function resolveNodeBinary() {
   const cfg = vscode.workspace.getConfiguration(SECTION);
   const custom = String(cfg.get('nodePath') || '').trim();
-  if (custom && fs.existsSync(custom)) return { cmd: custom, args: [], env: {} };
+  const tried = [];
 
-  // 常见安装位置
+  // ① 用户显式指定的路径 —— 版本不够也照用，但要在日志里讲清楚
+  if (custom && fs.existsSync(custom)) {
+    const major = nodeMajorVersion(custom);
+    if (major && major < MIN_NODE_MAJOR) {
+      log(`⚠ 设置的 nodePath（${custom}）是 v${major}，低于要求的 v${MIN_NODE_MAJOR}，可能启动失败`);
+      output?.appendLine(
+        `⚠ connect-workbuddy.nodePath 指向 Node v${major}，本扩展需要 v${MIN_NODE_MAJOR}+。` +
+        `请升级 Node，或清空该设置改用 VS Code 自带的 Electron。`
+      );
+    }
+    return { cmd: custom, args: [], env: {} };
+  }
+
+  // ② 常见安装位置（Windows）
   const probe = [
     'C:/Program Files/nodejs/node.exe',
     'C:/Program Files (x86)/nodejs/node.exe',
   ];
   for (const p of probe) {
-    if (fs.existsSync(p)) return { cmd: p, args: [], env: {} };
+    if (!fs.existsSync(p)) continue;
+    tried.push(p + ' → v' + (nodeMajorVersion(p) || '?'));
+    if (nodeMajorVersion(p) >= MIN_NODE_MAJOR) return { cmd: p, args: [], env: {} };
   }
-  // 从 PATH 里找
+
+  // ③ 从 PATH 里找（Linux / macOS 主要靠这条）
   try {
     const which = process.platform === 'win32' ? 'where' : 'which';
     const out = execFileSync(which, ['node'], { encoding: 'utf8', windowsHide: true, timeout: 3000 });
-    const first = String(out).split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
-    if (first && fs.existsSync(first)) return { cmd: first, args: [], env: {} };
-  } catch { /* ignore */ }
+    const cands = String(out).split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    for (const first of cands) {
+      if (!fs.existsSync(first)) continue;
+      const major = nodeMajorVersion(first);
+      tried.push(first + ' → v' + (major || '?'));
+      if (major >= MIN_NODE_MAJOR) return { cmd: first, args: [], env: {} };
+    }
+  } catch { /* PATH 里没有 node，正常 */ }
 
-  // 兜底：让 VS Code 自带的 Electron 以 node 模式运行
+  // ④ 兜底：VS Code 自带的 Electron 以 node 模式运行。
+  //    它的 Node 版本跟着 VS Code 走，1.116 已经是很新的 Node，够用。
+  if (tried.length) {
+    log(`系统中找到的 node 版本都低于 v${MIN_NODE_MAJOR}：${tried.join('、')}，改用 VS Code 内置运行时`);
+    output?.appendLine(
+      `提示：系统中的 Node 版本偏低（${tried.join('、')}），已改用 VS Code 内置的运行时。`
+    );
+  }
   return { cmd: process.execPath, args: [], env: { ELECTRON_RUN_AS_NODE: '1' } };
 }
 
@@ -201,6 +252,9 @@ async function ensureProxy(context) {
     } catch { /* ignore */ }
   }
 
+  // ⚠️ stdin 必须是 'pipe' 而不是 'ignore'：
+  //    代理在 Windows 上靠 stdin EOF 判断「父进程已退出」，'ignore' 时拿不到这个信号，
+  //    代理会在 VS Code 崩溃后变成孤儿进程。POSIX 上另用 ppid 轮询，两种方式都留着。
   const child = spawn(node.cmd, [...node.args, script, '--port', '0'], {
     env: {
       ...process.env,
@@ -210,15 +264,20 @@ async function ensureProxy(context) {
       WB_LEGACY_DSH_HOME: realDshHome,
       ...node.env,
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  // 不往 stdin 写任何东西，只是保持管道打开
+  try { child.stdin?.on('error', () => { /* EPIPE，进程已退出，忽略 */ }); } catch { /* ignore */ }
   proxyState.child = child;
   proxyState.token = token;
 
   const port = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('代理启动超时（15 秒）')), 15_000);
     let buf = '';
+    // 记下 stderr 尾部：代理崩了（比如 node 版本太低）时要把原因带给用户，
+    // 只报 "code=1" 完全没法排查。
+    const errTail = [];
     child.stdout.on('data', (d) => {
       const s = d.toString();
       buf += s;
@@ -233,7 +292,10 @@ async function ensureProxy(context) {
     });
     child.stderr.on('data', (d) => {
       for (const line of d.toString().split('\n')) {
-        if (line.trim()) output.appendLine('[proxy:err] ' + line.trimEnd());
+        if (!line.trim()) continue;
+        output.appendLine('[proxy:err] ' + line.trimEnd());
+        errTail.push(line.trim());
+        if (errTail.length > 8) errTail.shift();
       }
     });
     child.on('error', (e) => {
@@ -242,7 +304,8 @@ async function ensureProxy(context) {
     });
     child.on('exit', (code) => {
       clearTimeout(timer);
-      reject(new Error('代理进程提前退出，code=' + code));
+      const detail = errTail.length ? '\n' + errTail.join('\n') : '';
+      reject(new Error('代理进程提前退出，code=' + code + detail));
     });
   });
 
@@ -1459,10 +1522,58 @@ class WorkBuddyProvider {
   }
 }
 
+// ── 旧版本共存检测 ────────────────────────────────────────────────
+// 0.7.9 起 publisher 从 `local` 改成了 `connect-workbuddy`，扩展 ID 跟着变。
+// VS Code 把不同 ID 当成两个**不同扩展**，所以「装新版」不会顶掉旧版 ——
+// 两个会同时激活，各自：
+//   · registerLanguageModelChatProvider('workbuddy') 注册同一个 vendor
+//     → 模型下拉框出现两份 WorkBuddy 模型
+//   · 各自拉起一个代理进程 → 两个进程同时刷新同一账号的 token
+//     → 互相让对方的 refreshToken 失效，表现为「登录反复失效」
+// 所以检测到旧版还在时，直接不激活自己，让用户先卸载。
+const LEGACY_EXTENSION_IDS = ['local.vscode-connect-workbuddy'];
+
+function findInstalledLegacyExtension() {
+  for (const id of LEGACY_EXTENSION_IDS) {
+    try {
+      const ext = vscode.extensions.getExtension(id);
+      if (ext) return ext;
+    } catch { /* 旧版 VS Code 上该 API 行为可能不同，忽略 */ }
+  }
+  return null;
+}
+
 // ── 激活 / 停用 ───────────────────────────────────────────────────
 async function activate(context) {
   output = vscode.window.createOutputChannel('WorkBuddy for Copilot');
   context.subscriptions.push(output);
+
+  // ⚠️ 必须在拉代理之前判断：否则已经多起了一个进程，credentials 冲突照样发生
+  const legacyExt = findInstalledLegacyExtension();
+  if (legacyExt) {
+    const msg =
+      '检测到旧版 Connect WorkBuddy（' + legacyExt.id + '）仍处于安装状态。\n' +
+      '两个版本会同时注册模型、同时刷新凭据，可能导致登录反复失效。\n' +
+      '请先卸载旧版，然后重载窗口。';
+    output.appendLine('⚠ ' + msg.replace(/\n/g, ' '));
+    vscode.window
+      .showErrorMessage('WorkBuddy：请先卸载旧版本扩展', '立即卸载', '查看说明')
+      .then(async (pick) => {
+        if (pick === '立即卸载') {
+          await vscode.commands.executeCommand(
+            'workbench.extensions.uninstallExtension',
+            legacyExt.id,
+          );
+          vscode.window.showInformationMessage('已发出卸载请求，请重载窗口后使用。');
+        } else if (pick === '查看说明') {
+          await vscode.env.openExternal(vscode.Uri.parse(
+            'https://github.com/a2689307431/vscode-connect-workbuddy#从-078-及更早版本升级',
+          ));
+        }
+      }, () => { /* 用户关掉提示，不处理 */ });
+    // 不注册 provider、不拉代理、不建状态栏 —— 让旧版继续工作，避免两个都半死不活
+    return;
+  }
 
   // 先把代理准备好（要么复用，要么自己拉起），失败不阻塞激活
   try {

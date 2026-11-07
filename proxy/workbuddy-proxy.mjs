@@ -55,6 +55,57 @@ const PORT = portIdx >= 0 ? Number(argv[portIdx + 1]) : 8799;
 // 手动双击启动时没有这个环境变量 → 跳过校验（方便 curl 调试）。
 const AUTH_TOKEN = process.env.WB_PROXY_TOKEN || '';
 
+// ── 随父进程退出（防孤儿） ────────────────────────────────────────────────
+// extension.js 的 deactivate() 会杀这个进程，但**只在 VS Code 正常退出时**才调用。
+// 崩溃、被 kill -9、macOS 强制退出、Linux 上 OOM、Docker 里重启容器……
+// 这些情况下 deactivate 不会执行，代理就会变成孤儿进程常驻。
+//
+// 两个平台的检测方式不同：
+//   · POSIX：轮询 process.ppid。父进程死了会被 init/systemd 收养，ppid 变成 1
+//     （macOS 上 launchd 也是 1）。这条对 Linux / macOS 都有效。
+//   · Windows：没有可靠的 ppid 轮询（父进程死掉 ppid 仍指向原值），
+//     靠扩展注入的 stdin 管道 —— 父进程消失时 stdin 会 EOF。
+//     所以 spawn 时 stdio 里的 stdin 必须是 'pipe'，不能是 'ignore'。
+if (AUTH_TOKEN) {
+  // 只有「被扩展拉起的」才需要守护；手动启动时保持常驻
+  let orphanChecks = 0;
+  let stdinClosed = false;
+
+  if (process.platform === 'win32' && process.stdin) {
+    const markClosed = () => { stdinClosed = true; };
+    process.stdin.on('end', markClosed);
+    process.stdin.on('close', markClosed);
+    process.stdin.on('error', markClosed);
+    process.stdin.resume();
+  }
+
+  const startParentWatch = () => {
+    setInterval(() => {
+      let orphaned = false;
+
+      if (process.platform === 'win32') {
+        // stdin 已 EOF 且没人来连 → 父进程没了
+        orphaned = stdinClosed;
+      } else {
+        // 父进程被收养 → ppid 变 1（个别容器环境是 0）
+        orphaned = process.ppid === 1 || process.ppid === 0;
+      }
+
+      if (!orphaned) {
+        orphanChecks = 0;
+        return;
+      }
+
+      // 连续两次确认，避免启动瞬间的抖动
+      if (++orphanChecks < 2) return;
+      console.log('父进程已退出，代理随之关闭');
+      process.exit(0);
+    }, 5000).unref();
+  };
+
+  startParentWatch();
+}
+
 const CN_CHAT_BASE = 'https://copilot.tencent.com';
 const GLOBAL_CHAT_BASE = 'https://www.workbuddy.ai';
 const PRODUCT = 'SaaS';

@@ -72,7 +72,12 @@
 - 已安装 **GitHub Copilot Chat** 扩展（免费版即可，模型请求由 WorkBuddy 侧处理）
 - 一个 **WorkBuddy / CodeBuddy** 账号
 
-> 不需要 Node.js —— 找不到独立 node 时，扩展会用 VS Code 自带的 Electron 跑代理。
+> **不需要手动装 Node.js**。扩展会按顺序找可用运行时：
+> 设置里的 `nodePath` → Windows 常见安装路径 → `PATH` 里的 `node` →
+> 最后兜底用 VS Code 自带的 Electron。
+>
+> 如果系统里的 Node 低于 **v18**（比如 Ubuntu 22.04 自带的 v12），
+> 扩展会自动跳过它、改用 VS Code 内置运行时，不会因此报错。
 >
 > VS Code Insiders / VSCodium / Cursor / Windsurf 也可以，模型分组配置文件会
 > 按当前编辑器自己的目录去写。
@@ -96,14 +101,28 @@ code --install-extension vscode-connect-workbuddy-x.y.z.vsix --force
 
 ### 从 0.7.8 及更早版本升级
 
+> ⚠️ **升级前请先卸载旧版**，否则两个版本会同时工作，互相干扰。
+
 0.7.9 起扩展 ID 从 `local.vscode-connect-workbuddy` 改成了
 `connect-workbuddy.vscode-connect-workbuddy`（原来那个 `local` 是占位名）。
+VS Code 把不同 ID 当**不同扩展**，直接装新版**不会顶掉旧版**，两个都还在。
 
-**升级不会丢登录状态** —— 扩展会在启动时把旧目录里的 `vault/`（凭据）和
-`dsh-home/`（设备标识）自动复制过来，旧目录保持不动以方便回滚。
+**不卸载会怎样**（新版本会检测到并主动停用自己，但最好还是手动卸干净）：
 
-如果升级后模型列表空了，执行一次 `WorkBuddy: 登录账号` 即可；
-也可以手动把
+- 模型下拉框里出现两份 WorkBuddy 模型
+- 两个代理进程同时跑，同时刷新同一账号的 token
+- 两边的 refreshToken 会互相让对方失效，表现为「登录反复失效」
+
+**正确步骤**：
+
+1. 扩展面板里找到旧版 `Connect WorkBuddy`（publisher 显示为 `local`），点卸载
+2. 安装新版 `.vsix`
+3. `Developer: Reload Window`
+4. 登录状态会自动迁移，**不需要重新登录**
+
+如果新版启动时提示「检测到旧版仍处于安装状态」，按弹窗里的「立即卸载」即可。
+
+若升级后模型列表空了，执行一次 `WorkBuddy: 登录账号` 即可；也可以手动把
 `<userDataDir>/globalStorage/local.vscode-connect-workbuddy/vault/`
 整目录复制到
 `<userDataDir>/globalStorage/connect-workbuddy.vscode-connect-workbuddy/vault/`。
@@ -318,7 +337,44 @@ VS Code Copilot Chat
 
 1. 命令面板 → `WorkBuddy: 显示日志`，看有没有 `已发现 N 个 WorkBuddy 账号`
 2. 没有账号：执行 `WorkBuddy: 登录账号`
-3. 日志里报代理起不来：设置 `connect-workbuddy.nodePath` 指向一个可用的 node 可执行文件
+3. 日志里报代理起不来：看 `[proxy:err]` 那几行，通常是 Node 版本或权限问题
+   （扩展现在会把 stderr 最后几行带进错误提示）
+
+### 提示「请先卸载旧版本扩展」
+
+说明机器上同时装着旧 ID（`local.vscode-connect-workbuddy`）的新版。
+两个版本会同时注册模型、同时刷新凭据，导致登录反复失效。
+
+按弹窗里的「立即卸载」，然后重载窗口即可。
+
+### 报了 `fetch is not defined` 或 `AbortSignal.timeout is not a function`
+
+说明实际运行的 Node 太老（低于 v18）。代理用到了这两个特性。
+
+- 清空设置 `connect-workbuddy.nodePath`，让扩展自动挑选可用运行时
+- 或把 Node 升级到 v18 以上
+- Linux 上如果 `which node` 指向很老的版本（如 Ubuntu 22.04 的 v12），
+  扩展会自动跳过它
+
+### Linux / macOS 上代理进程残留
+
+正常情况下关闭 VS Code 会结束代理。如果 VS Code 崩溃或被强杀，
+代理会自己检测到父进程消失并退出（POSIX 上轮询 ppid，Windows 上监听 stdin EOF），
+最多 10 秒。
+
+万一仍有残留：
+
+```bash
+# Linux / macOS
+pkill -f workbuddy-proxy.mjs
+```
+
+```powershell
+# Windows
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like '*workbuddy-proxy*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
 
 ### 登录会被自动续期吗
 
