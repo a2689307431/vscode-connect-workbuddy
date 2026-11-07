@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'HANDOFF.md'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 三平台：语法 / 模块加载 / 内嵌模块校验 / 打包 ──────────────────
+  build:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 语法检查
+        run: |
+          node --check extension.js
+          node --check proxy/workbuddy-proxy.mjs
+          node --check scripts/check-upstream.mjs
+
+      # 比 --check 更强：真的启动一次，能抓出「语法合法但运行时就炸」
+      # 比如注释块吞掉 import 导致的 ReferenceError。
+      # 代理是**可执行脚本**（没有 export），判断依据是它打印 WB_PROXY_READY。
+      #
+      # 注意：CI 机器上没有凭据。代理在没有账号时**仍然**会打印 READY
+      #（只是模型列表为空），所以这个检查对 CI 有效。
+      # 用 HOME 指向临时目录，确保不会读到任何真实用户数据。
+      - name: 代理能启动
+        shell: bash
+        run: |
+          set -e
+          TMP=$(mktemp -d)
+          LOG="$TMP/proxy.log"
+          mkdir -p "$TMP/home" "$TMP/vault" "$TMP/dsh" "$TMP/nolegacy"
+
+          HOME="$TMP/home" \
+          USERPROFILE="$TMP/home" \
+          DSH_HOME="$TMP/home/.dsh" \
+          WB_PROXY_TOKEN=ci-test-token \
+          WB_VAULT_DIR="$TMP/vault" \
+          WB_DSH_HOME="$TMP/dsh" \
+          WB_LEGACY_DSH_HOME="$TMP/nolegacy" \
+            node proxy/workbuddy-proxy.mjs --port 0 > "$LOG" 2>&1 &
+          PID=$!
+
+          ok=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if grep -q 'WB_PROXY_READY port=' "$LOG"; then ok=1; break; fi
+            if ! kill -0 $PID 2>/dev/null; then break; fi
+          done
+
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+
+          echo '--- 代理输出 ---'
+          head -25 "$LOG" || true
+
+          if [ "$ok" != "1" ]; then
+            echo "::error::代理 30 秒内没有进入就绪状态"
+            exit 1
+          fi
+          echo "✓ 代理启动正常"
+          rm -rf "$TMP"
+
+      - name: 内嵌模块 sha256 校验
+        run: node scripts/check-upstream.mjs --verify-only
+
+      # extension.js 依赖 vscode 模块，无法直接 require；
+      # 用 esbuild 之外最轻的办法：只解析不执行（--check 已覆盖），
+      # 这里额外确认 package.json 关键字段齐全。
+      - name: package.json 完整性
+        run: |
+          node -e "
+            const p = require('./package.json');
+            const must = ['name','displayName','version','publisher','engines','main','contributes'];
+            const miss = must.filter(k => !p[k]);
+            if (miss.length) { console.error('缺少字段:', miss); process.exit(1); }
+            const v = p.contributes?.languageModelChatProviders?.[0];
+            if (!v || v.vendor !== 'workbuddy') {
+              console.error('languageModelChatProviders 配置缺失或 vendor 不是 workbuddy');
+              process.exit(1);
+            }
+            console.log('version =', p.version, '| publisher =', p.publisher);
+            console.log('命令数:', (p.contributes.commands || []).length);
+            console.log('设置数:', Object.keys(p.contributes.configuration?.properties || {}).length);
+          "
+
+      - name: 打包 vsix
+        run: npx --yes @vscode/vsce package --allow-missing-repository
+
+      - name: 包体积与内容检查
+        shell: bash
+        run: |
+          set -e
+          vsix=$(ls *.vsix | head -1)
+          size=$(wc -c < "$vsix")
+          echo "vsix: $vsix"
+          echo "大小: $size 字节（约 $((size/1024)) KB）"
+
+          # 超过 800KB 说明打进了不该打的东西（曾因上游 .tgz 涨到 3.3MB）
+          if [ "$size" -gt 800000 ]; then
+            echo "::error::vsix 超过 800KB，检查 .vscodeignore 是否漏了什么"
+            exit 1
+          fi
+          # 太小也不对：核心文件丢了
+          if [ "$size" -lt 150000 ]; then
+            echo "::error::vsix 小于 150KB，可能缺了 lib/ 或 proxy/"
+            exit 1
+          fi
+
+          # 必须包含这三个文件
+          for f in extension.js proxy/workbuddy-proxy.mjs lib/package.json; do
+            if ! unzip -l "$vsix" | grep -q "$f"; then
+              echo "::error::vsix 里缺少 $f"
+              exit 1
+            fi
+          done
+          # host-heartbeat 必须存在（名字随上游版本变，用通配）
+          if ! unzip -l "$vsix" | grep -q "host-heartbeat-"; then
+            echo "::error::vsix 里缺少 host-heartbeat 模块"
+            exit 1
+          fi
+          # 绝不能进包的
+          for f in HANDOFF.md node_modules "_newver" ".tgz"; do
+            if unzip -l "$vsix" | grep -q "$f"; then
+              echo "::error::vsix 里混进了 $f"
+              exit 1
+            fi
+          done
+          echo "✓ 包内容检查通过"
+
+      - name: 上传 vsix（便于下载检查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.os }}
+          path: '*.vsix'
+          retention-days: 7
+
+  # ── 单跑一次：上游是否有新版（不阻塞，只提示）────────────────────
+  upstream-notice:
+    name: 上游版本检查
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 对比 registry
+        run: node scripts/check-upstream.mjs

@@ -23,6 +23,11 @@ proxy/*.bat
 node_modules
 .vscode
 .git
+# CI 配置与 GitHub 元数据不进包
+.github
+.github/**
+.gitignore
+.editorconfig
 
 # ⚠️ 下划线开头的临时/备份目录（旧 git 历史含本机路径与账号信息，绝不能进包）
 _*
