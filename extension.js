@@ -108,6 +108,49 @@ async function probeHealth(url, timeoutMs = 1500) {
  *   ② 8799 上已有手动启动的代理 → 复用（不杀）
  *   ③ 都没有 → 自己 spawn 一个随机端口的，记下 PID
  */
+/**
+ * 把旧的 `local.vscode-connect-workbuddy` 存储目录迁移到当前扩展 ID 下。
+ *
+ * 为什么需要：`globalStoragePath` = `<userDataDir>/globalStorage/<publisher>.<name>`。
+ * 0.7.8 及以前的 publisher 是 `local`，改名后路径会变，老用户的 `vault/`（登录凭据）
+ * 和 `dsh-home/`（设备盐）看起来会「凭空消失」，被迫重新登录。
+ *
+ * 规则：
+ *   · 只在新目录**还没有**对应内容时才复制，绝不覆盖已有数据
+ *   · 复制而非移动 —— 万一用户又装回旧版本，旧目录仍然可用
+ *   · 只复制 vault/ 与 dsh-home/，不碰日志之类
+ *   · 全程失败只记日志，不阻塞激活
+ */
+function migrateLegacyStorage(context) {
+  const cur = context.globalStoragePath;
+  if (!cur) return;
+
+  const curId = path.basename(cur);
+  // 只有「已经是新 ID」时才需要从旧 ID 拉数据
+  const LEGACY_IDS = ['local.vscode-connect-workbuddy'];
+  if (LEGACY_IDS.includes(curId)) return;
+
+  const parent = path.dirname(cur);
+  for (const oldId of LEGACY_IDS) {
+    const from = path.join(parent, oldId);
+    if (from === cur || !fs.existsSync(from)) continue;
+
+    for (const sub of ['vault', 'dsh-home']) {
+      const src = path.join(from, sub);
+      const dst = path.join(cur, sub);
+      if (!fs.existsSync(src)) continue;
+      try {
+        if (fs.existsSync(dst) && fs.readdirSync(dst).length) continue; // 已有数据，不覆盖
+        fs.mkdirSync(parent, { recursive: true });
+        fs.cpSync(src, dst, { recursive: true });
+        log(`已从旧目录迁移 ${sub}：${oldId} → ${curId}`);
+      } catch (e) {
+        log(`迁移 ${sub} 失败：`, e?.message || e);
+      }
+    }
+  }
+}
+
 async function ensureProxy(context) {
   const cfg = vscode.workspace.getConfiguration(SECTION);
   const manual = String(cfg.get('proxyUrl') || '').trim().replace(/\/+$/, '');
@@ -138,11 +181,19 @@ async function ensureProxy(context) {
 
   // 凭据存储目录交给扩展管理 —— 这样不依赖 ~/.dsh，也不依赖 WorkBuddy 桌面端。
   // OAuth 登录拿到的账号会写到 globalStoragePath 下。
+  //
+  // ⚠️ globalStoragePath 的路径含 "<publisher>.<name>"，所以**改 publisher 会换目录**，
+  //    老用户的账号看起来会「消失」。这里做一次性迁移（见 migrateLegacyStorage）。
   const vaultDir = path.join(context.globalStoragePath, 'vault');
   // 内嵌模块是 DSH 插件，会往 $DSH_HOME 写设备盐。这里把它指到扩展自己的目录，
   // 家目录一个文件都不新增；旧的 ~/.dsh 只作为「读取旧账号」的来源。
   const dshHome = path.join(context.globalStoragePath, 'dsh-home');
   const realDshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  try {
+    migrateLegacyStorage(context);
+  } catch (e) {
+    log('迁移旧存储目录失败（不影响新账号登录）：', e?.message || e);
+  }
   for (const d of [vaultDir, dshHome]) {
     try {
       // POSIX 上收紧到 0700：里面是凭据和设备盐

@@ -13,7 +13,8 @@
 
 **被内嵌的文件**：
 
-- `lib/host-heartbeat-DFqDsnte.js`（来自 `dsh-connect-workbuddy@5.18.2`）
+- `lib/host-heartbeat-CQ3ot5-F.js`（来自 `dsh-connect-workbuddy@5.20.2`）
+  - 更早的 `host-heartbeat-DFqDsnte.js`（`5.18.2`）已被替换
   - 更早的 `host-heartbeat-BtMcdOIa.js`（`5.13.1`）已被替换
 
 **版权**：

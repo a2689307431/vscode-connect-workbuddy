@@ -1,6 +1,9 @@
 # Connect WorkBuddy
 
-**把 WorkBuddy 的模型，接进 VS Code Copilot Chat 的模型下拉框。**
+**把 WorkBuddy（CodeBuddy）的模型，接进 VS Code Copilot Chat 的模型下拉框。**
+
+> WorkBuddy · CodeBuddy · 腾讯 Copilot · VS Code · Copilot Chat ·
+> `languageModelChatProviders` · DeepSeek · GLM · Kimi · 多账号 · 积分查询 · 每日签到
 
 装好扩展、登录一次，模型选择器里就会多出 WorkBuddy 的模型，
 和你已有的 Copilot 模型放在同一个下拉框里 —— 直接切，不用换界面。
@@ -12,6 +15,16 @@
 
 > **📦 [下载最新版本](https://github.com/a2689307431/vscode-connect-workbuddy/releases)**
 
+### 为什么不在 VS Code 应用市场？
+
+这类扩展**无法上架官方 Marketplace**，不是没提交，是不能：
+
+- 它的工作原理需要绕过上游的客户端识别（否则请求会被拦）
+- 微软的开发者协议明确禁止规避第三方技术保护措施
+- 硬要提交的结果是 publisher 账号被永久封禁
+
+所以走 GitHub Release 分发。这既是合规的边界，也是对使用者负责 —— 详情见文末[免责声明](#免责声明)。
+
 ---
 
 ## 它能做什么
@@ -19,9 +32,11 @@
 - 🧩 **接进 Copilot 的整套工作流** —— 模型出现在 Copilot Chat 的模型下拉框里，
   `@workspace`、`#file`、Agent 模式、自定义指令、MCP 工具都能照常用
 - 🔀 **一个下拉框里切换** —— 和 GPT、Claude 等 Copilot 自带模型并列，不用在两个面板之间来回切
-- 🔐 **OAuth 登录** —— 在浏览器里点几下就完成，不用手抄 token
+- 📊 **上下文占用实时显示** —— 聊天框底部的进度条显示真实 token 用量，
+  知道离塞满还有多远，该不该开新会话
+- 🔐 **OAuth 登录** —— 在浏览器里点几下就完成，不用手抄 token，凭据自动续期
 - 🖼️ **支持图片** —— 截图、设计稿可以直接粘贴给模型
-- 🧠 **显示思考过程** —— 推理模型的思考链会以可折叠的形式展示
+- 🧠 **思考过程折叠展示** —— 模型返回推理链时，会显示成可折叠的一整块
 - 👥 **多账号** —— 登录多个账号，模型按账号分组列出，随时切换
 - 💳 **状态栏看余额** —— 当前账号的剩余积分常驻状态栏，切账号自动跟着换
 - 📅 **每日签到** —— 一个命令给所有账号签到，积分明细里直接看到连续天数
@@ -42,6 +57,7 @@
 | `@workspace` / Agent / MCP | 自己的一套 | 直接复用 Copilot 的 |
 | 代码补全 / inline edit | ✅ | ❌ |
 | 多账号分组 | — | ✅ |
+| 状态栏积分 / 每日签到 | — | ✅ |
 
 两边可以用同一个账号，不冲突。
 **想要代码补全和 inline edit，用官方插件；想在 Copilot 里统一聊天，用这个。**
@@ -56,6 +72,11 @@
 - 已安装 **GitHub Copilot Chat** 扩展（免费版即可，模型请求由 WorkBuddy 侧处理）
 - 一个 **WorkBuddy / CodeBuddy** 账号
 
+> 不需要 Node.js —— 找不到独立 node 时，扩展会用 VS Code 自带的 Electron 跑代理。
+>
+> VS Code Insiders / VSCodium / Cursor / Windsurf 也可以，模型分组配置文件会
+> 按当前编辑器自己的目录去写。
+
 ### 步骤
 
 1. 打开 **[Releases](https://github.com/a2689307431/vscode-connect-workbuddy/releases)** 页面，
@@ -67,8 +88,25 @@
 也可以用命令行安装：
 
 ```bash
-code --install-extension vscode-connect-workbuddy-x.y.z.vsix
+code --install-extension vscode-connect-workbuddy-x.y.z.vsix --force
 ```
+
+> ⚠️ **装完必须重载窗口**。不重载的话，模型提供方和代理进程还是旧的，
+> 容易出现「改了没生效」的错觉。
+
+### 从 0.7.8 及更早版本升级
+
+0.7.9 起扩展 ID 从 `local.vscode-connect-workbuddy` 改成了
+`connect-workbuddy.vscode-connect-workbuddy`（原来那个 `local` 是占位名）。
+
+**升级不会丢登录状态** —— 扩展会在启动时把旧目录里的 `vault/`（凭据）和
+`dsh-home/`（设备标识）自动复制过来，旧目录保持不动以方便回滚。
+
+如果升级后模型列表空了，执行一次 `WorkBuddy: 登录账号` 即可；
+也可以手动把
+`<userDataDir>/globalStorage/local.vscode-connect-workbuddy/vault/`
+整目录复制到
+`<userDataDir>/globalStorage/connect-workbuddy.vscode-connect-workbuddy/vault/`。
 
 ---
 
@@ -102,6 +140,15 @@ WorkBuddy
 ```
 
 选一个，正常聊天即可。模型列表是从你的账号动态拉取的 —— 你账号能用什么，这里就有什么。
+
+### 3. 看上下文占用
+
+聊天框底部会显示当前会话用了多少上下文，比如 `41/1M 个令牌`，
+旁边的进度条和百分比会跟着每轮对话增长。
+
+- 这些数字来自 **WorkBuddy 服务端返回的真实用量**，不是估算值
+- 接近上限时，Copilot Chat 会提示你压缩或新建会话
+- 如果一直显示 `0/1M`，先确认版本 ≥ **0.7.8**，再重载窗口
 
 登录了多个账号后，下拉框会按账号分成几个组（见下面的 [多账号](#多账号)）：
 
@@ -193,23 +240,36 @@ VS Code 的模型下拉框只认它自己配置文件里的分组，扩展没法
 |---|---|---|
 | `connect-workbuddy.proxyUrl` | 空 | 留空 = 自动管理（推荐）。填了地址则完全使用外部端点，扩展不再插手 |
 | `connect-workbuddy.nodePath` | 空 | 运行代理用的 Node 路径。留空自动探测，都找不到时使用 VS Code 自带的 Electron |
-| `connect-workbuddy.debug` | `false` | 在输出面板打印详细日志 |
+| `connect-workbuddy.debug` | `false` | 在输出面板打印详细日志（排查问题时打开） |
 | `connect-workbuddy.hideLoginPrompt` | `false` | 不再在启动时提示登录（仍可用命令登录） |
 | `connect-workbuddy.showCreditsInStatusBar` | `true` | 在状态栏显示剩余积分 |
 | `connect-workbuddy.creditsRefreshSeconds` | `300` | 状态栏积分的自动刷新间隔（秒），最小 60 |
 | `connect-workbuddy.autoCheckin` | `false` | 每天首次启动时自动签到（每账号每天最多一次） |
-| `connect-workbuddy.apiKey` | `workbuddy-local-proxy` | 占位值，真正凭据由扩展注入 |
+| `connect-workbuddy.apiKey` | `workbuddy-local-proxy` | 占位值，仅用于外部代理场景。自动管理时真正的凭据由扩展注入，**不用改** |
 
 ---
 
 ## 支持的平台
 
-Windows / macOS / Linux 都支持。
+| 平台 | 状态 | 说明 |
+|---|---|---|
+| Windows | ✅ 主要开发平台 | 完整验证 |
+| macOS | ✅ 代码层面适配 | 路径 / 权限 / 子进程均有平台分支，未做大量实机验证 |
+| Linux | ⚠️ 可用但验证较少 | 见下 |
 
 ### 关于 Linux
 
 WorkBuddy 官方没有 Linux 客户端，但本扩展**不需要**它 ——
 登录走的是浏览器 OAuth，代理直接与 WorkBuddy 服务端通信。
+
+Linux 上需要留意：
+
+- **凭据权限**：`vault/` 目录会建成 `0700`、凭据文件 `0600`（明文 token，别用 root 跑）
+- **node 探测**：先看设置里的 `nodePath`，再从 `PATH` 里找 `node`，
+  最后兜底用 VS Code 自带的 Electron
+- **无图形界面**：没有浏览器时，登录会弹窗给出授权链接，可复制到别处打开
+
+遇到问题请连同 `WorkBuddy: 显示日志` 的输出一起提 issue。
 
 ---
 
@@ -217,23 +277,38 @@ WorkBuddy 官方没有 Linux 客户端，但本扩展**不需要**它 ——
 
 ```
 VS Code Copilot Chat
-        ↓  语言模型提供方接口（稳定 API）
+        ↓  languageModelChatProviders（VS Code 稳定 API）
    本扩展  extension.js
-        ↓  http://127.0.0.1:<随机端口>，随机 Bearer token
+        ↓  http://127.0.0.1:<随机端口>，进程内随机 Bearer token
    代理进程  proxy/workbuddy-proxy.mjs
+        ↓  import lib/host-heartbeat-*.js（第三方模块，负责请求整形）
         ↓  HTTPS
    WorkBuddy 服务端
 ```
 
+**为什么中间要隔一层代理**：
+
+1. 凭据刷新只能一个进程做 —— 两个进程同时刷新会让对方的 refreshToken 失效
+2. 子进程崩了不影响扩展宿主
+3. 请求体整形逻辑是独立模块，隔离在代理里便于升级
+
 扩展启动时自动拉起代理，并且：
 
 - 端口随机，只监听 `127.0.0.1`（不对外网开放）
-- 每次启动生成一个随机 Bearer token，只有本扩展知道
-- 关闭 VS Code 时，扩展只结束自己拉起的那个进程
+- 每次启动生成随机 Bearer token，只有本扩展知道
+- 关闭 VS Code 时，扩展只结束自己拉起的那个进程（Windows 用 `taskkill /T /F`）
 
-每日签到也走这一层代理（`POST /checkin`），不会额外起服务，也不会另存一份凭据。
+每日签到也走这一层代理（`POST /checkin`），不额外起服务，也不另存凭据。
 
 已经手动在 `127.0.0.1:8799` 起了代理的话，扩展会直接复用它。
+
+### 数据放在哪
+
+| 内容 | 位置 |
+|---|---|
+| 登录凭据 | `<globalStorage>/vault/<区域>/*.json`（明文 token，POSIX 权限 0600） |
+| 设备标识 | `<globalStorage>/dsh-home/.workbuddy-device.json`（64 字符随机盐，**不是凭据**） |
+| 模型分组 | `<userDataDir>/chatLanguageModels.json`（VS Code 自己的配置，改动前会留备份） |
 
 ---
 
@@ -298,6 +373,34 @@ VS Code Copilot Chat
 能正常显示时，思考区应该是一**整块**、标题里的秒数持续增长（`Thought for 12s`）。
 如果看到的是一长串「Thought for 1s」碎片（每块只有一两个字），说明版本旧了，
 升级到 0.7.6 及以上。
+
+### 上下文窗口一直显示 0/1M
+
+先确认版本 ≥ **0.7.8**，装完执行 `Developer: Reload Window`。
+
+仍然为 0 的话，打开 `WorkBuddy: 显示日志`，把 `debug` 设为 `true` 后发一句话，
+日志里应该有：
+
+```
+上下文用量：prompt=41 completion=49
+```
+
+- 有这行但界面还是 0 → 上报格式和当前 Copilot Chat 版本不匹配，请提 issue 并附版本号
+- 没有这行 → 上游没返回 usage，把日志一起发来
+
+### 思考块碎片化或空白块
+
+- **一长串「Thought for 1s」**（每块只有一两个字）：版本 < 0.7.6，升级即可
+- **每个工具调用前多一个空思考块**：版本 0.7.6，升级到 0.7.7 及以上
+
+### 升级后模型列表空了
+
+0.7.9 起扩展 ID 变了（`local.` → `connect-workbuddy.`），
+`globalStorage` 路径跟着变。扩展会自动迁移旧凭据，但如果你中途装回了旧版本
+或手动删过目录，可能会漏。
+
+执行一次 `WorkBuddy: 登录账号` 即可恢复；也可以手动复制
+`globalStorage/local.vscode-connect-workbuddy/vault/` 到新目录。
 
 ### 模型名字都很陌生，点了全都报错
 
@@ -369,12 +472,15 @@ VS Code Copilot Chat
 ## 隐私
 
 - 对话内容只在你、VS Code、WorkBuddy 服务端之间传输
-- 扩展不做任何遥测，不上报任何数据
-- 登录凭据存在本机 VS Code 的 `globalStorage` 目录下 `vault/` 子目录中
-- 设备标识用的随机盐（64 字符，**不是凭据、不含账号信息**）也放在
-  `globalStorage` 下的 `dsh-home/` 里 —— **不会往家目录写任何文件**
+- 扩展**不做任何遥测**，不上报任何数据，没有内置统计/埋点
+- 登录凭据存在本机 VS Code 的 `globalStorage/vault/` 下，
+  POSIX 上目录 `0700`、文件 `0600`
+- 设备标识用的随机盐（64 字符，**不是凭据、不含账号信息**）放在 `globalStorage/dsh-home/`
+  —— **不会往家目录写任何文件**
 - 如果机器上原本就有 `~/.dsh`（装过 DSH 插件），扩展会**只读**它来补上缺失的账号，
   并把已有的设备盐复制一份过来（保持设备身份不变），之后不再读写该目录
+- 模型分组会写 `chatLanguageModels.json`（VS Code 自己的配置），
+  改动前留一份 `.workbuddy-bak` 备份
 
 ---
 
@@ -396,11 +502,11 @@ VS Code Copilot Chat
 
 | 项目 | 许可 | 本项目的使用方式 |
 |---|---|---|
-| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**（当前对应其 `5.18.2`），并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
+| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**（当前对应其 `5.20.2`），并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
 | `Sliverkiss/workbuddy2api` | MIT | 上游协议细节（基址选择、强制流式、CLI 形态请求头）的参考实现 |
 | `corrinehu/dsh-workbuddy-connect` | MIT | 本地代理的入站加固（回环校验、随机端口、随机 secret）与错误映射设计的参考 |
 
-其中 `lib/host-heartbeat-DFqDsnte.js` 是**原样再分发**（仅在文件头追加了归属说明），
+其中 `lib/host-heartbeat-CQ3ot5-F.js` 是**原样再分发**（仅在文件头追加了归属说明），
 文件头保留了原始版权与许可声明，请勿删除。
 
 ---
@@ -415,9 +521,13 @@ cd vscode-connect-workbuddy
 目录结构：
 
 ```
-extension.js                扩展入口：语言模型提供方 + 代理进程管理
-proxy/workbuddy-proxy.mjs   本地代理：登录、凭据刷新、请求整形
-lib/                        请求整形与指纹模块（源自官方插件，MIT）
+extension.js                 扩展入口：提供方、代理生命周期、命令、状态栏、签到
+proxy/workbuddy-proxy.mjs    本地代理：OAuth、凭据池、请求整形、积分、签到、错误分类
+lib/host-heartbeat-*.js      第三方模块（源自 dsh-connect-workbuddy，MIT），
+                             负责请求体整形与通道指纹，原样再分发、不要手改
+lib/package.json             记录上游版本与 sha256
+scripts/check-upstream.mjs   对比上游版本、校验内嵌文件 sha256
+proxy/tests/*.mjs            手工回归脚本，不进 vsix
 ```
 
 重新打包：
@@ -426,6 +536,24 @@ lib/                        请求整形与指纹模块（源自官方插件，M
 npm exec --yes --package @vscode/vsce -- vsce package --allow-missing-repository
 ```
 
+检查上游是否有新版：
+
+```bash
+npm run check:upstream
+```
+
+改动后建议至少跑：
+
+```bash
+node --check extension.js
+node --check proxy/workbuddy-proxy.mjs
+```
+
+更详细的实现约束与踩坑记录不在仓库里（避免泄露本机信息）。
+
 ## 许可
 
 [MIT](./LICENSE)
+
+内嵌的第三方模块遵循其原始 MIT 许可，版权与许可声明见
+[`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md)。
