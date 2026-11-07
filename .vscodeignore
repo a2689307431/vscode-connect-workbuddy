@@ -18,6 +18,8 @@ proxy/*.bat
 *.vsix
 *.txt
 *.log
+*.tgz
+*.zip
 node_modules
 .vscode
 .git

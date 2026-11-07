@@ -1052,6 +1052,51 @@ function estimateTokens(text) {
   return Math.ceil(cjk / 1.5 + other / 4);
 }
 
+// ── 上下文用量上报 ────────────────────────────────────────────────
+// Copilot Chat 的「上下文窗口 0/1M」进度条靠 provider 上报的 usage 数据驱动。
+// 格式由 Copilot 自己约定（mime = "usage"），参照
+// vizards.deepseek-v4-for-copilot 的 stream.js → reportCopilotContextUsage()：
+//
+//   progress.report(new LanguageModelDataPart(
+//     new TextEncoder().encode(JSON.stringify({
+//       prompt_tokens, completion_tokens, total_tokens,
+//       prompt_tokens_details: { cached_tokens },
+//     })),
+//     'usage',
+//   ));
+//
+// 不报的话界面永远显示 0/1M（实测 WorkBuddy 上游是**会**返回 usage 的，
+// 只是本扩展一直没解析，属于漏做，不是上游限制）。
+const USAGE_MIME = 'usage';
+
+function reportUsage(progress, usage) {
+  if (!usage || typeof usage !== 'object') return;
+  const prompt = Number(usage.prompt_tokens);
+  const completion = Number(usage.completion_tokens);
+  if (!Number.isFinite(prompt) && !Number.isFinite(completion)) return;
+
+  const data = {
+    prompt_tokens: Number.isFinite(prompt) ? prompt : 0,
+    completion_tokens: Number.isFinite(completion) ? completion : 0,
+    total_tokens: Number.isFinite(Number(usage.total_tokens))
+      ? Number(usage.total_tokens)
+      : (Number.isFinite(prompt) ? prompt : 0) + (Number.isFinite(completion) ? completion : 0),
+    prompt_tokens_details: {
+      cached_tokens: Number(usage.prompt_tokens_details?.cached_tokens
+        ?? usage.prompt_cache_hit_tokens ?? 0) || 0,
+    },
+  };
+
+  try {
+    const Ctor = vscode.LanguageModelDataPart;
+    if (typeof Ctor !== 'function') return; // 旧版 VS Code 没有这个 API
+    progress.report(new Ctor(new TextEncoder().encode(JSON.stringify(data)), USAGE_MIME));
+    log(`上下文用量：prompt=${data.prompt_tokens} completion=${data.completion_tokens}`);
+  } catch (e) {
+    log('上报上下文用量失败：', e?.message || e);
+  }
+}
+
 // ── 思考内容（LanguageModelThinkingPart） ─────────────────────────
 // 用途：把上游 delta.reasoning_content 显示成 Copilot Chat 里可折叠的「思考」块。
 // 参考实现：vizards.deepseek-v4-for-copilot 的 provider/stream.js → handleThinking()。
@@ -1244,6 +1289,9 @@ class WorkBuddyProvider {
       const pendingToolCalls = new Map();
       let reasoningChars = 0;
       let contentChars = 0;
+      // 上游在最后一个 chunk 里给 usage（请求已带 include_usage: true），
+      // 记下来在收尾时上报给 Copilot Chat 用于绘制上下文占用。
+      let usageReported = null;
 
       // ── 思考批处理 ──────────────────────────────────────────────
       // 上游把 reasoning_content 拆成 1~4 字符的碎片（实测一次回答 121 个 delta），
@@ -1280,6 +1328,9 @@ class WorkBuddyProvider {
 
       for await (const chunk of readSSE(res.body)) {
         if (token.isCancellationRequested) break;
+
+        // usage 出现在最后一个 chunk（此时 choices 里通常只有一个空 delta）
+        if (chunk.usage) usageReported = chunk.usage;
 
         const choice = chunk.choices?.[0];
         if (choice) {
@@ -1334,6 +1385,9 @@ class WorkBuddyProvider {
       }
 
       endThinkingRun();
+
+      // 收尾上报上下文用量（必须在所有 part 之后，Copilot 按顺序消费）
+      reportUsage(progress, usageReported);
 
       if (token.isCancellationRequested) log('已取消');
       else log(`完成：正文 ${contentChars} 字符，思考 ${reasoningChars} 字符`);
