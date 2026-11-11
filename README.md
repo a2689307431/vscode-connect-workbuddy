@@ -93,8 +93,43 @@
 code --install-extension vscode-connect-workbuddy-x.y.z.vsix --force
 ```
 
-> ⚠️ **装完必须重载窗口**。不重载的话，模型提供方和代理进程还是旧的，
-> 容易出现「改了没生效」的错觉。
+> ⚠️ **装完必须重载窗口**（`Ctrl+Shift+P` → `Developer: Reload Window`）。
+>
+> 扩展换的是磁盘上的文件，但**后台代理进程不会热更新** —— 不重载的话，
+> 你看到的新版本界面下面，跑的仍然是旧代码。这种情况下功能看起来「没变化」
+> 或者「修了但没生效」都是正常的。
+
+#### 覆盖升级时遇到「没生效」
+
+如果确认已经重载但还是旧行为，检查有没有残留的代理进程：
+
+```powershell
+# Windows
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like '*workbuddy-proxy*' } |
+  Select-Object ProcessId, CommandLine
+```
+
+```bash
+# Linux / macOS
+ps aux | grep workbuddy-proxy | grep -v grep
+```
+
+如果命令行的路径指向**旧版本目录**（比如删掉的 `-0.8.0`），说明它是个残留进程。
+结束它，再重载窗口：
+
+```powershell
+# Windows
+Stop-Process -Id <PID> -Force
+```
+
+```bash
+# Linux / macOS
+kill <PID>
+```
+
+> 这种残留的成因：Windows 允许已启动的程序继续运行，即使它的目录被删了。
+> 所以「覆盖安装 + 删旧目录」之后如果不重载，旧进程会一直活着。
 
 ### 从 0.7.8 及更早版本升级
 
