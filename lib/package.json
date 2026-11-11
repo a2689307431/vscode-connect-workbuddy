@@ -2,8 +2,8 @@
   "type": "module",
   "upstream": {
     "package": "dsh-connect-workbuddy",
-    "version": "5.20.2",
-    "file": "host-heartbeat-CQ3ot5-F.js",
-    "sha256": "555a98a0e3789a64fcb622bf8f07858d9c446078ef6bf1cc81812f2254c26581"
+    "version": "5.21.3",
+    "file": "host-heartbeat-WSrMdV6b.js",
+    "sha256": "339396e3cc38b91268cff626cf202f680f0158c2ef53227b54143377408f2ed6"
   }
 }

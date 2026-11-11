@@ -555,11 +555,11 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 
 | 项目 | 许可 | 本项目的使用方式 |
 |---|---|---|
-| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**（当前对应其 `5.20.2`），并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
+| `dsh-connect-workbuddy`（LaoDing） | MIT | **内嵌了 `lib/host-heartbeat-*.js`**（当前对应其 `5.21.3`），并调用其中的 `prepareChatBody` / `perturbChannelFingerprints`。这是本项目能与上游稳定通信的关键 |
 | `Sliverkiss/workbuddy2api` | MIT | 上游协议细节（基址选择、强制流式、CLI 形态请求头）的参考实现 |
 | `corrinehu/dsh-workbuddy-connect` | MIT | 本地代理的入站加固（回环校验、随机端口、随机 secret）与错误映射设计的参考 |
 
-其中 `lib/host-heartbeat-CQ3ot5-F.js` 是**原样再分发**（仅在文件头追加了归属说明），
+其中 `lib/host-heartbeat-WSrMdV6b.js` 是**原样再分发**（仅在文件头追加了归属说明），
 文件头保留了原始版权与许可声明，请勿删除。
 
 ---
