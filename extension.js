@@ -2382,14 +2382,15 @@ function currentVersion() {
 }
 
 // ── 更新用的网络层 ────────────────────────────────────────────────
-// 底层的 http/https + CONNECT 隧道在 update-net.js（不依赖 vscode，可单测）。
-// 这里只保留「跟 VS Code 配置/日志打交道」的那层薄封装。
+// 底层的 http/https / SOCKS5 / CONNECT 隧道都在 update-net.js
+// （不依赖 vscode，可以用 Node 直接跑测试）。这里只保留
+// 「跟 VS Code 配置/日志打交道」的那层薄封装。
 //
 // ⚠️ 不能用内置 fetch：扩展宿主里的 fetch（undici）不经过 @vscode/proxy-agent
 //    给 http/https 打的补丁，不读 http.proxy，也不读系统代理。
 //    国内用户不开 TUN 时直连 api.github.com 必然超时（2026-11-23 实测）。
 
-const { normalizeProxyUrl, systemProxy, httpGet, readStreamAll } = require('./update-net');
+const { parseProxy, normalizeProxyUrl, systemProxy, httpGet, readStreamAll } = require('./update-net');
 
 /** 读某个配置节里的 proxy 字段（string） */
 function configProxyOf(section) {
@@ -2401,14 +2402,26 @@ function configProxyOf(section) {
   }
 }
 
+/** 跟随 VS Code 的 http.proxyStrictSSL（公司自签证书代理需要关掉校验） */
+function strictSSLSetting() {
+  try {
+    return vscode.workspace.getConfiguration('http').get('proxyStrictSSL') !== false;
+  } catch {
+    return true;
+  }
+}
+
 let cachedDetectedProxy; // undefined = 还没探测过
 
 /** 探测可用代理。返回 '' 表示直连。 */
 function detectProxyUrl() {
   if (cachedDetectedProxy !== undefined) return cachedDetectedProxy;
 
-  const raw =
-    configProxyOf('http') ||
+  // http.proxy 若是 PAC 脚本地址，我们**不支持**，跳过它继续往下找系统代理。
+  const fromVSCode = configProxyOf('http');
+  const vsCodeUsable = fromVSCode && parseProxy(fromVSCode).type !== 'pac' ? normalizeProxyUrl(fromVSCode) : '';
+
+  const fromEnv =
     process.env.HTTPS_PROXY ||
     process.env.https_proxy ||
     process.env.HTTP_PROXY ||
@@ -2417,12 +2430,18 @@ function detectProxyUrl() {
     process.env.all_proxy ||
     '';
 
-  cachedDetectedProxy = normalizeProxyUrl(raw) || systemProxy();
+  cachedDetectedProxy = vsCodeUsable || normalizeProxyUrl(fromEnv) || systemProxy();
   return cachedDetectedProxy;
 }
 
 /** 直连失败一次后记忆「本机需要代理」，后续请求直接走隧道 */
 let preferProxy = false;
+
+/** 清掉探测缓存（用户改了代理设置后手动重查用） */
+function invalidateProxyCache() {
+  cachedDetectedProxy = undefined;
+  preferProxy = false;
+}
 
 /**
  * 带代理兜底的 GET。
@@ -2434,22 +2453,23 @@ let preferProxy = false;
  *   3. 直连失败且探测到代理 → 走隧道重试，并记住这次教训
  */
 async function httpGetSmart(url, opts = {}) {
+  const strictSSL = strictSSLSetting();
   const explicit = normalizeProxyUrl(configProxyOf(SECTION));
-  if (explicit) return httpGet(url, { ...opts, proxy: explicit });
+  if (explicit) return httpGet(url, { ...opts, proxy: explicit, strictSSL });
 
   if (preferProxy) {
     const detected = detectProxyUrl();
-    if (detected) return httpGet(url, { ...opts, proxy: detected });
+    if (detected) return httpGet(url, { ...opts, proxy: detected, strictSSL });
   }
 
   try {
-    return await httpGet(url, { ...opts, proxy: '' });
+    return await httpGet(url, { ...opts, proxy: '', strictSSL });
   } catch (e) {
     const detected = detectProxyUrl();
     if (!detected) throw e;
     log(`直连 ${new URL(url).host} 失败（${e?.message || e}），改走代理 ${detected} 重试`);
     preferProxy = true;
-    return httpGet(url, { ...opts, proxy: detected });
+    return httpGet(url, { ...opts, proxy: detected, strictSSL });
   }
 }
 
@@ -2899,6 +2919,10 @@ async function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand('connect-workbuddy.checkUpdates', async () => {
       try {
+        // 手动检查时重新探测代理：用户可能刚改完设置，不该被旧缓存拦住
+        invalidateProxyCache();
+        const proxy = detectProxyUrl();
+        output.appendLine(`[更新] 代理：${proxy || '（无，直连）'}`);
         await checkForUpdates({ silent: false, force: true });
       } catch (e) {
         const pick = await vscode.window.showErrorMessage(

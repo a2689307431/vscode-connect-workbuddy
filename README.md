@@ -341,6 +341,7 @@ VS Code 的模型下拉框只认它自己配置文件里的分组，扩展没法
 | `connect-workbuddy.creditsRefreshSeconds` | `300` | 状态栏积分的自动刷新间隔（秒），最小 60 |
 | `connect-workbuddy.autoCheckin` | `false` | 每天首次启动时自动签到（每账号每天最多一次） |
 | `connect-workbuddy.autoUpdate` | `true` | 每天最多一次检查 GitHub 新版本（见下面的[自动更新](#自动更新)） |
+| `connect-workbuddy.proxy` | 空 | **检查更新用的代理**，如 `http://127.0.0.1:7897` 或 `socks5://127.0.0.1:7891`。留空自动探测，见[检查更新时连不上 GitHub](#检查更新时连不上-github) |
 | `connect-workbuddy.apiKey` | `workbuddy-local-proxy` | 占位值，仅用于外部代理场景。自动管理时真正的凭据由扩展注入，**不用改** |
 
 ---
@@ -609,6 +610,44 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 2. **提示 SHA256 校验失败** —— 下载被中间层干扰（代理/镜像改写了内容）。
    重试一次；仍失败就去 Release 页面手动下载
 3. **提示已安装但版本号没变** —— 没重载窗口。`Developer: Reload Window`
+
+### 检查更新时连不上 GitHub
+
+**如果你的电脑需要代理才能上 GitHub，请务必看这一节。**
+
+扩展里的 `fetch` 用的是 Node 内置实现，**不读系统代理**（这是 VS Code 扩展宿主的限制，
+不是本扩展偷懒）。所以即使你浏览器能打开 GitHub，扩展也可能连不上。
+
+自动探测顺序（不用配就能用的场景）：
+
+1. VS Code 自己的 `http.proxy` 设置
+2. 环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+3. 系统代理：
+   - **Windows**：注册表 `Internet Settings`（Clash / V2RayN / mihomo 开「系统代理」就会写这里）
+   - **macOS**：`scutil --proxy`（ClashX / Surge / Stash 勾「设为系统代理」）
+   - **Linux**：GNOME 设置（`gsettings`，即「设置 → 网络 → 网络代理 → 手动」）
+
+探测到了但连不通、或者你用的是 **PAC 脚本**（本扩展不支持 PAC），就显式配：
+
+```jsonc
+{
+  // HTTP 代理（Clash/mihomo 的「混合端口」通常就是这个）
+  "connect-workbuddy.proxy": "http://127.0.0.1:7897",
+
+  // 或者 SOCKS5（同样支持，含 用户名:密码@）
+  "connect-workbuddy.proxy": "socks5://127.0.0.1:7891"
+}
+```
+
+支持的写法：`127.0.0.1:7897`（自动当 HTTP）、`http://…`、`socks5://…`、`socks5h://…`、
+`socks://…`、`http://user:pass@host:port`。
+
+公司代理用了自签证书时，VS Code 的 `http.proxyStrictSSL: false` 会被跟随（扩展会跳过证书校验）。
+
+> 只影响「检查更新 / 下载 vsix」。本地 WorkBuddy 代理和聊天请求都走 `127.0.0.1`，与代理无关。
+>
+> 用 TUN 模式（Clash Verge 的「Tun 模式」/ sing-box）时直连本来就能通，不用配。
+> 改完代理设置后执行一次 `WorkBuddy: 检查更新` 即可立即生效（会自动重新探测）。
 
 ### 状态栏有个 ↑ 角标是什么意思
 
