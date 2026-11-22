@@ -26,6 +26,7 @@ const MAX_BYTES = 800 * 1024;
 // 必须存在的条目（比较时已剥掉 vsix 的 `extension/` 前缀）
 const MUST_HAVE = [
   'extension.js',
+  'update-net.js',
   'package.json',
   'proxy/workbuddy-proxy.mjs',
   'lib/package.json',
@@ -117,7 +118,7 @@ if (entries.length) {
   for (const n of entries) console.log('  ' + n);
 
   // vsix 是 OPC 包，真正的内容都在 `extension/` 下面。
-  // 比较前先剥掉这层前缀，规则就可以按��展目录的样子写。
+  // 比较前先剥掉这层前缀，规则就可以按扩展目录的样子写。
   const PREFIX = 'extension/';
   const rel = entries.map((n) => (n.startsWith(PREFIX) ? n.slice(PREFIX.length) : n));
 

@@ -14,6 +14,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const http = require('node:http');
+const https = require('node:https');
+const tls = require('node:tls');
 const { spawn, execFileSync } = require('node:child_process');
 
 const SECTION = 'connect-workbuddy';
@@ -37,6 +40,8 @@ const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // activate() 里赋值的扩展上下文（checkForUpdates 需要读写 globalState）
 let extensionContext = null;
+// 最近一次查更新失败的原因（用于给用户更准的提示，而不是一句「网络问题」）
+let lastUpdateError = '';
 // 已知的新版本号；非空时状态栏会加个提示
 let pendingUpdateVersion = null;
 
@@ -2376,6 +2381,78 @@ function currentVersion() {
   }
 }
 
+// ── 更新用的网络层 ────────────────────────────────────────────────
+// 底层的 http/https + CONNECT 隧道在 update-net.js（不依赖 vscode，可单测）。
+// 这里只保留「跟 VS Code 配置/日志打交道」的那层薄封装。
+//
+// ⚠️ 不能用内置 fetch：扩展宿主里的 fetch（undici）不经过 @vscode/proxy-agent
+//    给 http/https 打的补丁，不读 http.proxy，也不读系统代理。
+//    国内用户不开 TUN 时直连 api.github.com 必然超时（2026-11-23 实测）。
+
+const { normalizeProxyUrl, systemProxy, httpGet, readStreamAll } = require('./update-net');
+
+/** 读某个配置节里的 proxy 字段（string） */
+function configProxyOf(section) {
+  try {
+    const v = vscode.workspace.getConfiguration(section).get('proxy');
+    return typeof v === 'string' ? v.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+let cachedDetectedProxy; // undefined = 还没探测过
+
+/** 探测可用代理。返回 '' 表示直连。 */
+function detectProxyUrl() {
+  if (cachedDetectedProxy !== undefined) return cachedDetectedProxy;
+
+  const raw =
+    configProxyOf('http') ||
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    process.env.ALL_PROXY ||
+    process.env.all_proxy ||
+    '';
+
+  cachedDetectedProxy = normalizeProxyUrl(raw) || systemProxy();
+  return cachedDetectedProxy;
+}
+
+/** 直连失败一次后记忆「本机需要代理」，后续请求直接走隧道 */
+let preferProxy = false;
+
+/**
+ * 带代理兜底的 GET。
+ *
+ * 顺序：
+ *   1. 用户显式配了 `connect-workbuddy.proxy` → 直接走隧道（用户说了算）
+ *   2. 没有显式配置 → **先直连**。VS Code 的 proxy-agent 若已生效，
+ *      直连其实已经走了系统代理，不会走到第 3 步
+ *   3. 直连失败且探测到代理 → 走隧道重试，并记住这次教训
+ */
+async function httpGetSmart(url, opts = {}) {
+  const explicit = normalizeProxyUrl(configProxyOf(SECTION));
+  if (explicit) return httpGet(url, { ...opts, proxy: explicit });
+
+  if (preferProxy) {
+    const detected = detectProxyUrl();
+    if (detected) return httpGet(url, { ...opts, proxy: detected });
+  }
+
+  try {
+    return await httpGet(url, { ...opts, proxy: '' });
+  } catch (e) {
+    const detected = detectProxyUrl();
+    if (!detected) throw e;
+    log(`直连 ${new URL(url).host} 失败（${e?.message || e}），改走代理 ${detected} 重试`);
+    preferProxy = true;
+    return httpGet(url, { ...opts, proxy: detected });
+  }
+}
+
 /**
  * 查最新 Release。返回 { version, vsixUrl, digest, notes, htmlUrl } 或 null。
  * 网络失败/没有 Release 都返回 null（调用方静默处理，不打扰用户）。
@@ -2383,18 +2460,20 @@ function currentVersion() {
 async function fetchLatestRelease() {
   const url = `https://api.github.com/repos/${RELEASE_REPO}/releases/latest`;
   try {
-    const res = await fetch(url, {
+    const res = await httpGetSmart(url, {
       headers: {
         accept: 'application/vnd.github+json',
         'user-agent': 'vscode-connect-workbuddy-updater',
       },
-      signal: AbortSignal.timeout(15_000),
+      timeout: 15_000,
     });
-    if (!res.ok) {
+    if (res.status !== 200) {
+      res.stream.resume();
       log(`查更新失败：HTTP ${res.status}`);
+      lastUpdateError = `HTTP ${res.status}`;
       return null;
     }
-    const j = await res.json();
+    const j = JSON.parse((await readStreamAll(res.stream)).toString('utf8'));
     const version = String(j.tag_name || j.name || '').replace(/^v/i, '').trim();
     if (!version) return null;
 
@@ -2427,7 +2506,8 @@ async function fetchLatestRelease() {
       htmlUrl: j.html_url || `https://github.com/${RELEASE_REPO}/releases`,
     };
   } catch (e) {
-    log('查更新异常：' + (e?.message || e));
+    lastUpdateError = String(e?.message || e);
+    log('查更新异常：' + lastUpdateError);
     return null;
   }
 }
@@ -2445,16 +2525,19 @@ async function downloadVsix(release, progress) {
   const target = path.join(dir, release.vsixName);
 
   progress?.report({ message: '正在下载…' });
-  const res = await fetch(release.vsixUrl, {
+  const res = await httpGetSmart(release.vsixUrl, {
     headers: { 'user-agent': 'vscode-connect-workbuddy-updater' },
-    signal: AbortSignal.timeout(120_000),
+    timeout: 120_000,
   });
-  if (!res.ok) throw new Error(`下载失败：HTTP ${res.status}`);
+  if (res.status !== 200) {
+    res.stream.resume();
+    throw new Error(`下载失败：HTTP ${res.status}`);
+  }
 
-  const total = Number(res.headers.get('content-length')) || release.size || 0;
+  const total = Number(res.headers['content-length']) || release.size || 0;
   const chunks = [];
   let received = 0;
-  for await (const chunk of res.body) {
+  for await (const chunk of res.stream) {
     chunks.push(chunk);
     received += chunk.length;
     if (total > 0) {
@@ -2499,8 +2582,24 @@ async function checkForUpdates({ silent = false, force = false } = {}) {
   const cur = currentVersion();
   const latest = await fetchLatestRelease();
   if (!latest) {
-    if (!silent) vscode.window.showWarningMessage('WorkBuddy：检查更新失败（网络问题或还没有 Release）');
-    return { status: 'error' };
+    if (!silent) {
+      const detected = detectProxyUrl();
+      const why = lastUpdateError || '未知原因';
+      const hint = detected
+        ? `已探测到代理 ${detected} 但仍失败，可在设置里显式指定 \`connect-workbuddy.proxy\`。`
+        : '如果你访问 GitHub 需要代理，请在设置里填 `connect-workbuddy.proxy`（如 http://127.0.0.1:7897）。';
+      void vscode.window
+        .showWarningMessage(`WorkBuddy：检查更新失败 — ${why}`, '查看日志', '打开设置')
+        .then((pick) => {
+          if (pick === '查看日志') vscode.commands.executeCommand(`${SECTION}.showLogs`);
+          else if (pick === '打开设置') {
+            vscode.commands.executeCommand('workbench.action.openSettings', 'connect-workbuddy.proxy');
+          }
+        });
+      output.appendLine(`[更新] 检查失败：${why}`);
+      output.appendLine(`[更新] ${hint}`);
+    }
+    return { status: 'error', error: lastUpdateError };
   }
 
   if (compareVersions(latest.version, cur) <= 0) {

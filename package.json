@@ -2,7 +2,7 @@
   "name": "vscode-connect-workbuddy",
   "displayName": "Connect WorkBuddy",
   "description": "把 WorkBuddy 的模型接进 VS Code Copilot Chat 的模型下拉框，支持多账号分组与剩余积分显示（非官方）",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "connect-workbuddy",
   "license": "MIT",
   "engines": {
@@ -81,6 +81,11 @@
           "type": "boolean",
           "default": true,
           "description": "每天最多一次检查 GitHub 是否有新版本。发现新版会弹窗提示，可选「立即更新」（下载 vsix 并安装，安装前校验 SHA256）或「跳过此版本」。注意：VS Code 自带的「自动更新」勾选框对 vsix 安装的扩展无效，所以这里单独提供。"
+        },
+        "connect-workbuddy.proxy": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "访问 GitHub 用的 HTTP 代理，例如 `http://127.0.0.1:7897`。留空则自动探测：先看 VS Code 的 `http.proxy`，再看环境变量 `HTTPS_PROXY`，最后看系统代理设置（Windows 注册表 / macOS `scutil`）。\n\n⚠️ 扩展里的 `fetch` 不读系统代理，所以需要代理才能访问 GitHub 的用户，若自动探测失败就必须在这里显式填写。只影响「检查更新 / 下载 vsix」，不影响本地 WorkBuddy 代理。"
         }
       }
     },
