@@ -28,13 +28,15 @@ const { execFileSync } = require('node:child_process');
 
 /**
  * 解析代理字符串，返回
- *   { type:'http'|'socks5', host, port, username, password } |
+ *   { type:'http'|'socks5', host, port, username, password, useTLS } |
+ *   { type:'unsupported', raw, reason } |
  *   { type:'pac', raw } |
- *   { type:'', raw }  ← 空/无法识别
+ *   { type:'', raw }  ← 空
  *
  * 认得的输入：
  *   127.0.0.1:7897                        → http
  *   http://127.0.0.1:7897                 → http
+ *   https://proxy.corp:8443               → http + useTLS（CONNECT 本身走 TLS）
  *   socks5://127.0.0.1:7891               → socks5
  *   socks5h://user:pass@127.0.0.1:1080    → socks5 + 认证
  *   http=1.2.3.4:8080;https=1.2.3.4:8443  → 取 https 那项（Windows 注册表格式）
@@ -64,25 +66,32 @@ function parseProxy(raw) {
   }
   if (!u.hostname) return { type: '', raw: s };
 
+  // URL.hostname 对 IPv6 会带方括号（"[::1]"），net.connect 要的是裸地址
+  const host = u.hostname.startsWith('[') && u.hostname.endsWith(']') ? u.hostname.slice(1, -1) : u.hostname;
+
   const proto = u.protocol.replace(':', '').toLowerCase();
   const username = u.username ? decodeURIComponent(u.username) : '';
   const password = u.password ? decodeURIComponent(u.password) : '';
 
   if (proto === 'socks5' || proto === 'socks5h' || proto === 'socks') {
-    return { type: 'socks5', host: u.hostname, port: Number(u.port || 1080), username, password, raw: s };
+    return { type: 'socks5', host, port: Number(u.port || 1080), username, password, useTLS: false, raw: s };
   }
   if (proto === 'http' || proto === 'https') {
     return {
       type: 'http',
-      host: u.hostname,
+      host,
       port: Number(u.port || (proto === 'https' ? 443 : 80)),
       username,
       password,
+      // https:// 代理：连代理本身要 TLS，再在其上发 CONNECT
+      useTLS: proto === 'https',
       raw: s,
     };
   }
-  // socks4 / ftp / ws 等：不支持
-  return { type: '', raw: s };
+  if (proto === 'socks4' || proto === 'socks4a') {
+    return { type: 'unsupported', raw: s, reason: 'SOCKS4 协议太老，本扩展不支持；请换成 SOCKS5 或 HTTP 代理' };
+  }
+  return { type: 'unsupported', raw: s, reason: `不支持的代理协议 ${proto}://` };
 }
 
 /** 把代理字符串归一成可展示/可复用的形式（老代码只想要一个字符串） */
@@ -98,6 +107,7 @@ function normalizeProxyUrl(raw) {
     return `socks5://${auth}${p.host}:${p.port}`;
   }
   if (p.type === 'pac') return p.raw;
+  if (p.type === 'unsupported') return p.raw;
   return '';
 }
 
@@ -334,6 +344,9 @@ function httpGet(targetUrl, { headers = {}, timeout = 20_000, proxy = '', redire
         new Error('检测到 PAC 脚本代理，本扩展不支持。请在设置里填 HTTP 或 SOCKS5 代理地址（如 http://127.0.0.1:7897）')
       );
     }
+    if (p.type === 'unsupported') {
+      return reject(new Error(`代理不可用：${p.reason}`));
+    }
 
     const handle = (res) => {
       const status = res.statusCode || 0;
@@ -391,13 +404,16 @@ function httpGet(targetUrl, { headers = {}, timeout = 20_000, proxy = '', redire
       const auth = p.username
         ? { 'proxy-authorization': 'Basic ' + Buffer.from(`${p.username}:${p.password || ''}`).toString('base64') }
         : {};
-      const connectReq = http.request({
+      // https:// 代理：连代理本身要 TLS（公司代理常见 8443 之类）
+      const proxyMod = p.useTLS ? https : http;
+      const connectReq = proxyMod.request({
         host: p.host,
         port: p.port,
         method: 'CONNECT',
         path: `${u.hostname}:${port}`,
         headers: auth,
         timeout,
+        rejectUnauthorized: strictSSL,
       });
       connectReq.once('connect', (res, socket) => {
         if ((res.statusCode || 0) !== 200) {
@@ -418,7 +434,9 @@ function httpGet(targetUrl, { headers = {}, timeout = 20_000, proxy = '', redire
 
     // ③ 直连；或 http 目标走 http 代理（用绝对 URI）
     const useAbsolute = p.type === 'http' && !isHttps;
-    const req = (isHttps ? https : http).request(
+    // http 目标 + https 代理时要先跟代理建 TLS
+    const dialMod = isHttps || (useAbsolute && p.useTLS) ? https : http;
+    const req = dialMod.request(
       {
         host: useAbsolute ? p.host : u.hostname,
         port: useAbsolute ? p.port : port,

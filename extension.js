@@ -2526,7 +2526,12 @@ async function fetchLatestRelease() {
       htmlUrl: j.html_url || `https://github.com/${RELEASE_REPO}/releases`,
     };
   } catch (e) {
-    lastUpdateError = String(e?.message || e);
+    const raw = String(e?.message || e);
+    // 证书类错误单独给提示：公司代理带自签证书时很常见，用户不知道要关 proxyStrictSSL
+    const isCert = /UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT|CERT_|unable to verify|depth zero|certificate/i.test(raw);
+    lastUpdateError = isCert
+      ? `${raw}\n（证书校验失败。若是公司代理的自签证书，可把 VS Code 设置 http.proxyStrictSSL 设为 false）`
+      : raw;
     log('查更新异常：' + lastUpdateError);
     return null;
   }

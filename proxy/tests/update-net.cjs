@@ -45,6 +45,26 @@ const bad = (name, e) => {
     else bad(`PAC 识别 ${s}`, `得到 ${p.type}`);
   }
 
+  // https:// 代理要标记 useTLS（连代理本身走 TLS）
+  const tlsProxy = parseProxy('https://proxy.corp:8443');
+  if (tlsProxy.type === 'http' && tlsProxy.useTLS === true && tlsProxy.port === 8443) ok('https:// 代理 → useTLS');
+  else bad('https:// 代理', JSON.stringify(tlsProxy));
+
+  // IPv6 要去掉方括号，否则 net.connect 连不上
+  const v6 = parseProxy('http://[::1]:7897');
+  if (v6.host === '::1') ok('IPv6 代理去括号');
+  else bad('IPv6 代理', JSON.stringify(v6));
+  const v6s = parseProxy('socks5://[::1]:1080');
+  if (v6s.type === 'socks5' && v6s.host === '::1') ok('IPv6 SOCKS5 去括号');
+  else bad('IPv6 SOCKS5', JSON.stringify(v6s));
+
+  // 不支持的协议要明确报错，不能静默变直连
+  for (const s of ['socks4://1.2.3.4:1080', 'ftp://x:21']) {
+    const p = parseProxy(s);
+    if (p.type === 'unsupported') ok(`不支持的协议明确标记 ${s}`);
+    else bad(`unsupported ${s}`, `得到 type=${p.type}（会被静默当直连！）`);
+  }
+
   const auth = parseProxy('socks5://user:p%40ss@10.0.0.1:1080');
   if (auth.username === 'user' && auth.password === 'p@ss') ok('SOCKS5 用户名密码解码');
   else bad('SOCKS5 认证解析', JSON.stringify(auth));
