@@ -603,6 +603,15 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 
 先说清楚：刚发版后几分钟内 GitHub 的 Release 接口可能还没刷新，稍等重试。
 
+> **如果你看到的是「GitHub API 限流」**：这是 GitHub 的未认证配额（每小时 60 次，
+> **按出口 IP 算**）被用光了。机场节点、公司 NAT、校园网的出口 IP 都是共享的，
+> 别人用完了你也用不了，跟你的代理配没配好无关。
+>
+> 扩展会自动改用 GitHub 的**静态页面**兜底（不消耗配额），这种情况下能正常更新，
+> 但拿不到 SHA256 校验值 —— 弹窗会明确提示。如果静态页面也失败，直接去
+> [Release 页面](https://github.com/a2689307431/vscode-connect-workbuddy/releases/latest)
+> 手动下载 vsix。
+
 其他常见原因：
 
 1. **网络访问不到 api.github.com** —— 国内需要能访问 GitHub 的网络环境。
@@ -610,6 +619,31 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 2. **提示 SHA256 校验失败** —— 下载被中间层干扰（代理/镜像改写了内容）。
    重试一次；仍失败就去 Release 页面手动下载
 3. **提示已安装但版本号没变** —— 没重载窗口。`Developer: Reload Window`
+
+### 想看排查日志
+
+扩展会把更新过程的每一步写到：
+
+```
+%TEMP%\workbuddy-update.log      （Windows）
+$TMPDIR/workbuddy-update.log     （macOS / Linux）
+```
+
+失败弹窗里也有「打开日志文件」按钮。里面能看到：
+
+```
+代理探测：http.proxy="" env="" system="http://127.0.0.1:7897" → 采用 "http://127.0.0.1:7897"
+GET api.github.com → 尝试直连（strictSSL=true）
+GET api.github.com → 直连成功 HTTP 403
+查 Release 失败：HTTP 403 body={"message":"API rate limit exceeded for ..."}
+判定为限流=true，尝试 Release 页面兜底
+atom feed 解析成功：v1.0.2
+资产列表解析结果：vscode-connect-workbuddy-1.0.2.vsix
+下载响应：HTTP 200 content-length=298244
+下载完成：...（298244 字节）
+```
+
+提 issue 时贴这段就够了。
 
 ### 检查更新时连不上 GitHub
 
