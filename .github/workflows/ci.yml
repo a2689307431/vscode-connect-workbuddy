@@ -83,6 +83,14 @@ jobs:
       - name: 内嵌模块 sha256 校验
         run: node scripts/check-upstream.mjs --verify-only
 
+      # 自动更新的网络层（update-net.js）：本地起假目标站 + 假 HTTP 代理 +
+      # 假 SOCKS5 代理，**完全不依赖外网**。
+      # 教训：1.0.0 的自动更新上线时只在本机「能直连」的环境验证过，
+      # 用户一开系统代理就全挂（扩展里的 fetch 不读系统代理）。
+      # 这一层必须在 CI 里守住，不能再靠「我这儿能跑」。
+      - name: 更新网络层（离线 mock 测试）
+        run: node proxy/tests/update-net.mock.cjs
+
       # extension.js 依赖 vscode 模块，无法直接 require；
       # 用 esbuild 之外最轻的办法：只解析不执行（--check 已覆盖），
       # 这里额外确认 package.json 关键字段齐全。

@@ -155,6 +155,8 @@
   ],
   "scripts": {
     "check:upstream": "node scripts/check-upstream.mjs",
-    "package": "node scripts/package.mjs && node scripts/verify-vsix.mjs dist"
+    "package": "node scripts/package.mjs && node scripts/verify-vsix.mjs dist",
+    "test:net": "node proxy/tests/update-net.mock.cjs",
+    "test:net:live": "node proxy/tests/update-net.cjs"
   }
 }
