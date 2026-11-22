@@ -21,6 +21,11 @@ proxy/*.bat
 *.tgz
 *.zip
 node_modules
+
+# 打包产物目录（`vsce package --out dist` 的输出位置）
+# 里面的 *.vsix 已被上面的规则挡掉，这行是防有人往 dist 里放别的文件
+dist/
+dist/**
 .vscode
 .git
 # CI 配置与 GitHub 元数据不进包

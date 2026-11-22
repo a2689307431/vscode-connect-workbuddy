@@ -1901,15 +1901,24 @@ const server = http.createServer(async (req, res) => {
       } catch { /* ignore */ }
       const current = await pickCurrentAccount(region, accts).catch(() => null);
 
-      if (accts.length <= 1) {
-        const data = base.data.map((m) => ({
-          ...m,
-          base_name: m.name,
-          account_id: accts[0]?.id ?? null,
-          account_name: accts[0]?.accountName ?? null,
-          account_current: accts.length === 1,
-        }));
-        return send(res, 200, { ...base, data });
+      // ⚠️ 以前这里是 `if (accts.length <= 1)` 走一条「不展开」的捷径，
+      //    直接把裸模型 id（如 `hy4std`）返回。后果很严重：
+      //
+      //    · 冷启动时 listAccounts() 可能还没扫完 vault → 慢一拍拿到 0 或 1 个账号
+      //      → 返回裸 id → 扩展侧 parseAccountModelId() 匹配不上
+      //      → 所有账号的模型 **混成一个组**（用户 2026-11-22 报的截图）
+      //    · 而且 `/v1/models` 的结果会被 VS Code 缓存（chat.cachedLanguageModels.v2），
+      //      一旦缓存了裸模型，要等下一次刷新才会变成分组形态
+      //    · 更糟的是它返回了 account_id/account_name 却没有把 id 编码成
+      //      `@<id>|<model>`，元数据自相矛盾
+      //
+      //    现在：只要有账号就一律展开成带前缀的 id。单账号时前缀是冗余的，
+      //    但「id 形态始终一致」远比省几个字节重要 —— 扩展侧、缓存、状态栏跟随
+      //    全都依赖这个约定。
+      if (!accts.length) {
+        // 真的一个账号都没有：别返回裸模型（会让下拉框出现点下去就报错的项），
+        // 给空列表，让扩展侧走「请先登录」的引导。
+        return send(res, 200, { ...base, data: [], accounts: [] });
       }
 
       const data = [];
@@ -2030,17 +2039,15 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '127.0.0.1', async () => {
   const actualPort = server.address().port;
 
-  // ⚠️ 这一行是扩展解析端口的约定格式，改动需同步 extension.js
-  console.log(`WB_PROXY_READY port=${actualPort}`);
-
-  console.log('─'.repeat(60));
-  console.log(`WorkBuddy 代理已启动  http://127.0.0.1:${actualPort}`);
-  console.log(`  模块   : ${path.basename(hbPath)}`);
-  console.log(`  鉴权   : ${AUTH_TOKEN ? '已启用（进程内随机 token）' : '未启用（手动启动模式）'}`);
-  console.log(`  数据   : ${PRIVATE_DSH_HOME || REAL_DSH_HOME}${PRIVATE_DSH_HOME ? '（扩展私有）' : ''}`);
-  console.log(`  端点   : POST /v1/chat/completions`);
-  console.log(`  模型   : GET /v1/models`);
-  console.log(`  健康   : GET /health`);
+  // ⚠️ WB_PROXY_READY 是扩展解析端口的约定格式，改动需同步 extension.js。
+  //
+  // ⚠️ 但**不能在打印 READY 之后再预热账号池**：扩展收到 READY 会立刻
+  //    去拉 /v1/models?perAccount=1，那时账号池还是空的，会返回裸模型 id
+  //    → VS Code 把不同账号的模型混成一个组并写进 chat.cachedLanguageModels.v2
+  //    （用户 2026-11-22 报的截图就是这个问题）。
+  //
+  //    所以先把账号池和模型目录都准备好，再宣告 READY。代价是扩展多等
+  //    几百毫秒，换来的是第一眼看到的分组就是对的。
 
   // 先把旧 vault 里缺失的账号补进来，否则账号数会比实际少。
   // 必须在 getCred() 之前：扩展 vault 为空、旧 vault 有账号时也要能补上。
@@ -2052,6 +2059,42 @@ server.listen(PORT, '127.0.0.1', async () => {
       console.log(`  ⚠ 导入旧 vault 账号失败（${r}）：${e?.message || e}`);
     }
   }
+
+  // 预热账号池（/v1/models?perAccount=1 依赖它，不能等到请求时才填）
+  let prewarmOk = false;
+  try {
+    const accts = await listAccounts('cn');
+    prewarmOk = accts.length > 0;
+    if (accts.length > 1) {
+      console.log(`  账号池 : ${accts.length} 个账号已就绪`);
+    }
+  } catch (e) {
+    console.log(`  ⚠ 预热账号池失败：${e?.message || e}`);
+  }
+
+  // 预热模型目录（同理：客户端 READY 后可能几毫秒就来问）
+  for (const r of ['cn', 'global']) {
+    try {
+      await Promise.race([
+        ensureCatalog(r),
+        new Promise((res) => setTimeout(res, 8000)),
+      ]);
+    } catch (e) {
+      console.log(`  ⚠ 预热模型目录失败（${r}）：${e?.message || e}`);
+    }
+  }
+
+  // 到这里 /v1/models?perAccount=1 已经能给出正确的「每账号一组」形态了
+  console.log(`WB_PROXY_READY port=${actualPort}`);
+
+  console.log('─'.repeat(60));
+  console.log(`WorkBuddy 代理已启动  http://127.0.0.1:${actualPort}`);
+  console.log(`  模块   : ${path.basename(hbPath)}`);
+  console.log(`  鉴权   : ${AUTH_TOKEN ? '已启用（进程内随机 token）' : '未启用（手动启动模式）'}`);
+  console.log(`  数据   : ${PRIVATE_DSH_HOME || REAL_DSH_HOME}${PRIVATE_DSH_HOME ? '（扩展私有）' : ''}`);
+  console.log(`  端点   : POST /v1/chat/completions`);
+  console.log(`  模型   : GET /v1/models`);
+  console.log(`  健康   : GET /health`);
 
   try {
     const cred = await getCred('cn');

@@ -104,13 +104,14 @@ jobs:
           "
 
       - name: 打包 vsix
-        run: npx --yes @vscode/vsce package --allow-missing-repository
+        run: npx --yes @vscode/vsce package --allow-missing-repository --out dist
 
       - name: 包体积与内容检查
         shell: bash
         run: |
           set -e
-          vsix=$(ls *.vsix | head -1)
+          # 打包产物统一放 dist/（跟本地保持一致）
+          vsix=$(ls dist/*.vsix | head -1)
           size=$(wc -c < "$vsix")
           echo "vsix: $vsix"
           echo "大小: $size 字节（约 $((size/1024)) KB）"
@@ -151,7 +152,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vsix-${{ matrix.os }}
-          path: '*.vsix'
+          path: 'dist/*.vsix'
           retention-days: 7
 
   # ── 单跑一次：上游是否有新版（不阻塞，只提示）────────────────────

@@ -35,7 +35,7 @@
 - 🖼️ **支持图片** —— 截图、设计稿可以直接粘贴给模型
 - 🧠 **思考过程折叠展示** —— 模型返回推理链时，会显示成可折叠的一整块
 - 👥 **多账号** —— 登录多个账号，模型按账号分组列出，随时切换
-- 💳 **状态栏看余额** —— 当前账号的剩余积分常驻状态栏，切账号自动跟着换
+- 💳 **状态栏看余额** —— 当前所用账号的剩余积分常驻状态栏，在模型下拉框里换账号就跟着换，悬停还能看到账号池合计
 - 📅 **每日签到** —— 一个命令给所有账号签到，积分明细里直接看到连续天数
 - 🔌 **零依赖** —— 不用装 Node.js，也不用装 WorkBuddy 桌面客户端，扩展自己管理后台进程
 - 🛑 **不留后台** —— 关闭 VS Code，为它拉起的进程自动退出
@@ -200,6 +200,7 @@ WorkBuddy
 - 这些数字来自 **WorkBuddy 服务端返回的真实用量**，不是估算值
 - 接近上限时，Copilot Chat 会提示你压缩或新建会话
 - 如果一直显示 `0/1M`，先确认版本 ≥ **0.7.8**，再重载窗口
+- 工具调用频繁的 Agent 模式也算得准（工具结果、图片都计入）
 
 登录了多个账号后，下拉框会按账号分成几个组（见下面的 [多账号](#多账号)）：
 
@@ -238,15 +239,56 @@ VS Code 的模型下拉框只认它自己配置文件里的分组，扩展没法
 
 ## 查看剩余积分
 
-登录后右下角状态栏会显示当前账号的剩余积分，比如 `1284`。
+登录后右下角状态栏会显示**你当前所用账号**的剩余积分，比如 `2,571 · 193****5767`。
 
-- 鼠标悬停可以看到账号名、最近到期时间、有没有积分快过期
-- **点一下**打开明细：每个积分包还剩多少 / 总量多少、是每月重置还是某天到期
+- 在模型下拉框里**切换账号/模型的那一刻**就跟着换（不用先发一句话）
+- 鼠标悬停：账号名、最近到期时间、有没有积分快过期，以及**整个账号池的合计**
+- **点一下**打开钱包
 - 每 5 分钟自动刷新（可在设置里改间隔或直接关掉）
-- 切换到别的账号后立刻重新读一次
 - 积分快用完时状态栏会变黄
 
+### 钱包
+
+点状态栏（或命令面板 → `WorkBuddy: 钱包（账号余额）`）打开**账号池总览**：
+所有账号一行一个，带余额、区域、签到天数、token 到期时间，标题栏是**合计积分**。
+
+选中某个账号进入**明细页**：
+
+- 剩余合计、最近到期时间、30 天内会过期的部分
+- 每个积分包还剩多少 / 总量多少、是每月重置还是某天到期
+- 针对这个账号的操作：刷新、设为代理当前账号、只给它签到、复制明细
+
+明细页选「返回账号池」回到总览，Esc 逐级退出。
+
 > 明细由上游的用量接口实时返回，和你登录 codebuddy.cn 后在网页上看到的数字一致。
+> 国内站（codebuddy.cn）和国际站（workbuddy.ai）的账号会出现在**同一张表**里。
+
+---
+
+## 自动更新
+
+本扩展不上架 Marketplace，所以**没有商店的自动更新**。扩展自己实现了：
+
+- **启动时静默检查**（每天最多一次，可在设置里关掉 `connect-workbuddy.autoUpdate`）
+- 命令面板 → `WorkBuddy: 检查更新`（随时手动查）
+- 钱包 → 检查更新（有新版本时那行会显示版本号）
+- 状态栏文案末尾出现 `↑` 角标，悬停会提示有新版本
+
+发现新版本时弹窗，三个按钮：
+
+| 按钮 | 行为 |
+|---|---|
+| 立即更新 | 下载 vsix → 校验 SHA256 → 安装 → 提示重载窗口 |
+| 前往 Release 页面 | 用浏览器打开，自己下载 |
+| 跳过 x.y.z | 这个版本不再打扰（下次版本更新时会重新提示） |
+
+> **SHA256 是自动校验的** —— 用 GitHub 对 Release 附件自动计算的 digest，
+> 不需要作者或用户额外做什么。校验不通过会中止安装并提示。
+>
+> 装完**必须重载窗口**（`Developer: Reload Window`）新版本才生效。
+>
+> 想确认自带的「自动更新」勾选框没用：那个开关只对从商店装的扩展生效，
+> 从 vsix 装的扩展没有商店元数据，永远不会被它更新。
 
 ---
 
@@ -277,10 +319,12 @@ VS Code 的模型下拉框只认它自己配置文件里的分组，扩展没法
 |---|---|
 | `WorkBuddy: 登录账号` | 打开浏览器登录，支持国内站（codebuddy.cn）与国际站（workbuddy.ai） |
 | `WorkBuddy: 切换账号` | 选择默认账号（列表里带每个账号的剩余积分） |
-| `WorkBuddy: 查看剩余积分` | 弹出积分明细，可切换查看其它账号 |
+| `WorkBuddy: 钱包（账号余额）` | 账号池总览（带合计）→ 单个账号明细 |
 | `WorkBuddy: 每日签到` | 给所有账号签到，已签过的会跳过 |
 | `WorkBuddy: 按账号生成模型分组` | 往模型下拉框写入「每账号一组」，写完需重载窗口 |
 | `WorkBuddy: 刷新模型列表` | 账号权限或模型清单变化后重新拉取 |
+| `WorkBuddy: 检查更新` | 立即查 GitHub 有无新版本（可一键下载安装） |
+| `WorkBuddy: 重置更新检查计时` | 清掉「每天只查一次」的计时，下次启动重新自动检查（排查用） |
 | `WorkBuddy: 显示日志` | 打开输出面板，排查问题用 |
 
 ---
@@ -293,9 +337,10 @@ VS Code 的模型下拉框只认它自己配置文件里的分组，扩展没法
 | `connect-workbuddy.nodePath` | 空 | 运行代理用的 Node 路径。留空自动探测，都找不到时使用 VS Code 自带的 Electron |
 | `connect-workbuddy.debug` | `false` | 在输出面板打印详细日志（排查问题时打开） |
 | `connect-workbuddy.hideLoginPrompt` | `false` | 不再在启动时提示登录（仍可用命令登录） |
-| `connect-workbuddy.showCreditsInStatusBar` | `true` | 在状态栏显示剩余积分 |
+| `connect-workbuddy.showCreditsInStatusBar` | `true` | 在状态栏显示剩余积分（悬停可看账号池合计） |
 | `connect-workbuddy.creditsRefreshSeconds` | `300` | 状态栏积分的自动刷新间隔（秒），最小 60 |
 | `connect-workbuddy.autoCheckin` | `false` | 每天首次启动时自动签到（每账号每天最多一次） |
+| `connect-workbuddy.autoUpdate` | `true` | 每天最多一次检查 GitHub 新版本（见下面的[自动更新](#自动更新)） |
 | `connect-workbuddy.apiKey` | `workbuddy-local-proxy` | 占位值，仅用于外部代理场景。自动管理时真正的凭据由扩展注入，**不用改** |
 
 ---
@@ -360,6 +405,8 @@ VS Code Copilot Chat
 | 登录凭据 | `<globalStorage>/vault/<区域>/*.json`（明文 token，POSIX 权限 0600） |
 | 设备标识 | `<globalStorage>/dsh-home/.workbuddy-device.json`（64 字符随机盐，**不是凭据**） |
 | 模型分组 | `<userDataDir>/chatLanguageModels.json`（VS Code 自己的配置，改动前会留备份） |
+| 扩展状态 | `state.vscdb`（登录提示开关、自动签到日期、更新检查计时） |
+| 下载的新版本 | 系统临时目录 `vscode-connect-workbuddy-update/`（装完可删，下次升级前会自动清） |
 
 ---
 
@@ -551,6 +598,23 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
 弹窗里的 `+N` 来自签到接口，余额是另一个接口查的，上游偶尔有延迟。
 看到「连续天数」增加了就说明成功了，别重复点。
 
+### 检查更新提示失败
+
+先说清楚：刚发版后几分钟内 GitHub 的 Release 接口可能还没刷新，稍等重试。
+
+其他常见原因：
+
+1. **网络访问不到 api.github.com** —— 国内需要能访问 GitHub 的网络环境。
+   弹窗会提示「检查更新失败」，可点「前往 Release 页面」用浏览器手动下载
+2. **提示 SHA256 校验失败** —— 下载被中间层干扰（代理/镜像改写了内容）。
+   重试一次；仍失败就去 Release 页面手动下载
+3. **提示已安装但版本号没变** —— 没重载窗口。`Developer: Reload Window`
+
+### 状态栏有个 ↑ 角标是什么意思
+
+有新版本。点状态栏 → 钱包 → 「检查更新」即可升级。
+（如果已经升级过但角标还在，说明当前跑的还是旧代码，重载窗口即可。）
+
 ### 其他问题
 
 命令面板 → `WorkBuddy: 显示日志`，带上输出面板内容提 issue。
@@ -569,6 +633,10 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
   并把已有的设备盐复制一份过来（保持设备身份不变），之后不再读写该目录
 - 模型分组会写 `chatLanguageModels.json`（VS Code 自己的配置），
   改动前留一份 `.workbuddy-bak` 备份
+- **自动更新会连接 `api.github.com`**（只查版本号）和 `github.com`（下载 vsix），
+  不上传任何本地信息。不想联网就在设置里关掉 `connect-workbuddy.autoUpdate`
+- 为了知道你在模型下拉框里选了哪个账号，扩展会**只读** VS Code 自己的
+  `state.vscdb` 里的当前模型记录（不写入、不上报）
 
 ---
 
@@ -621,7 +689,14 @@ proxy/tests/*.mjs            手工回归脚本，不进 vsix
 重新打包：
 
 ```bash
-npm exec --yes --package @vscode/vsce -- vsce package --allow-missing-repository
+npm run package
+```
+
+产出的 vsix 放在 `dist/`（该目录已进 `.gitignore` 和 `.vscodeignore`，不会污染仓库也不会被打进包）。
+等价于：
+
+```bash
+npm exec --yes --package @vscode/vsce -- vsce package --allow-missing-repository --out dist
 ```
 
 检查上游是否有新版：
@@ -654,7 +729,8 @@ node --check proxy/workbuddy-proxy.mjs
 Visual Studio Code · Copilot Chat · GitHub Copilot · 模型下拉框 · 自定义模型 ·
 `languageModelChatProviders` · Language Model Chat Provider · BYOK · Bring Your Own Key ·
 DeepSeek V4 · DeepSeek-V4.1-Flash · GLM · Kimi · MiniMax · 混元 ·
-多账号 · 多账号切换 · 额度查看 · 剩余积分 · 每日签到 · 自动签到 ·
+多账号 · 多账号切换 · 额度查看 · 剩余积分 · 钱包 · 每日签到 · 自动签到 ·
+自动更新 · 一键升级 · 账号池 ·
 VS Code 扩展 · VS Code extension · Windows · macOS · Linux ·
 非官方 · unofficial · 学习研究
 

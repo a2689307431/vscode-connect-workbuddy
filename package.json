@@ -2,7 +2,7 @@
   "name": "vscode-connect-workbuddy",
   "displayName": "Connect WorkBuddy",
   "description": "把 WorkBuddy 的模型接进 VS Code Copilot Chat 的模型下拉框，支持多账号分组与剩余积分显示（非官方）",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "publisher": "connect-workbuddy",
   "license": "MIT",
   "engines": {
@@ -13,6 +13,7 @@
     "Chat"
   ],
   "activationEvents": [
+    "onLanguageModelChatProvider:workbuddy",
     "onStartupFinished"
   ],
   "main": "./extension.js",
@@ -63,7 +64,7 @@
         "connect-workbuddy.showCreditsInStatusBar": {
           "type": "boolean",
           "default": true,
-          "description": "在状态栏显示当前账号的剩余积分（每 5 分钟刷新一次，点一下可看明细）。"
+          "description": "在状态栏显示当前所用账号的剩余积分（每 5 分钟刷新一次；悬停可看账号池合计，点一下打开钱包）。"
         },
         "connect-workbuddy.creditsRefreshSeconds": {
           "type": "number",
@@ -75,43 +76,58 @@
           "type": "boolean",
           "default": false,
           "description": "每天第一次启动 VS Code 时自动签到（默认关闭）。开启后每个账号每天最多签一次；失败会在下次启动重试。"
+        },
+        "connect-workbuddy.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "每天最多一次检查 GitHub 是否有新版本。发现新版会弹窗提示，可选「立即更新」（下载 vsix 并安装，安装前校验 SHA256）或「跳过此版本」。注意：VS Code 自带的「自动更新」勾选框对 vsix 安装的扩展无效，所以这里单独提供。"
         }
       }
     },
     "commands": [
       {
         "command": "connect-workbuddy.login",
-        "title": "WorkBuddy: 登录账号",
+        "title": "登录账号",
         "category": "WorkBuddy"
       },
       {
         "command": "connect-workbuddy.switchAccount",
-        "title": "WorkBuddy: 切换账号",
+        "title": "切换账号",
         "category": "WorkBuddy"
       },
       {
         "command": "connect-workbuddy.showCredits",
-        "title": "WorkBuddy: 查看剩余积分",
+        "title": "钱包（账号余额）",
         "category": "WorkBuddy"
       },
       {
         "command": "connect-workbuddy.checkin",
-        "title": "WorkBuddy: 每日签到",
+        "title": "每日签到",
         "category": "WorkBuddy"
       },
       {
         "command": "connect-workbuddy.syncGroups",
-        "title": "WorkBuddy: 按账号生成模型分组",
+        "title": "按账号生成模型分组",
         "category": "WorkBuddy"
       },
       {
         "command": "connect-workbuddy.refresh",
-        "title": "WorkBuddy: 刷新模型列表",
+        "title": "刷新模型列表",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.checkUpdates",
+        "title": "检查更新",
+        "category": "WorkBuddy"
+      },
+      {
+        "command": "connect-workbuddy.resetUpdateCheck",
+        "title": "重置更新检查计时",
         "category": "WorkBuddy"
       },
       {
         "command": "connect-workbuddy.showLogs",
-        "title": "WorkBuddy: 显示日志",
+        "title": "显示日志",
         "category": "WorkBuddy"
       }
     ]
@@ -133,6 +149,7 @@
     "openai-compatible"
   ],
   "scripts": {
-    "check:upstream": "node scripts/check-upstream.mjs"
+    "check:upstream": "node scripts/check-upstream.mjs",
+    "package": "npx --yes @vscode/vsce package --out dist"
   }
 }
