@@ -150,6 +150,6 @@
   ],
   "scripts": {
     "check:upstream": "node scripts/check-upstream.mjs",
-    "package": "npx --yes @vscode/vsce package --out dist"
+    "package": "node scripts/package.mjs"
   }
 }

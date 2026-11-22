@@ -103,8 +103,11 @@ jobs:
             console.log('设置数:', Object.keys(p.contributes.configuration?.properties || {}).length);
           "
 
+      # 走 scripts/package.mjs 而不是直接 npx vsce：
+      # vsce 的 --out 指向不存在的路径时会当成**文件名**，生成一个叫 `dist` 的文件；
+      # CI 里 dist/ 是 gitignored 的，必须先建目录。脚本里已处理，本地也用同一份。
       - name: 打包 vsix
-        run: npx --yes @vscode/vsce package --allow-missing-repository --out dist
+        run: npm run package
 
       - name: 包体积与内容检查
         shell: bash
