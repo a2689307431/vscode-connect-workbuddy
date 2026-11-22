@@ -113,9 +113,12 @@ jobs:
       #    里面**没有 unzip.exe**，`unzip -l x.vsix | grep -q foo` 会永远失败，
       #    误报成「vsix 里缺少 extension.js」（CI #6 就是这么挂的：ubuntu/macos 绿、windows 红）。
       #    改成解析 ZIP central directory，三平台结果一致。
+      #
+      # ⚠️ 参数传**目录**，别写 `dist/*.vsix`：Windows 默认 shell 是 pwsh，**不展开通配符**，
+      #    会把 `*.vsix` 当字面量传进来 → ENOENT（CI #7 就是这么挂的）。
+      #    脚本支持传目录并自动选里面最新的 vsix。
       - name: 包体积与内容检查
-        run: |
-          node scripts/verify-vsix.mjs dist/vscode-connect-workbuddy-*.vsix
+        run: node scripts/verify-vsix.mjs dist
 
       - name: 上传 vsix（便于下载检查）
         uses: actions/upload-artifact@v4
