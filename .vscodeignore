@@ -11,6 +11,17 @@ scripts/**
 _test-*.mjs
 _rename.mjs
 
+# 备份 / 临时产物（踩过：package.json.bak 被 vsce 打进了发布包）
+*.bak
+*.bak-*
+*.old
+*.orig
+*.rej
+*.swp
+*.tmp
+package.json.bak
+package.json.bak-*
+
 # 手动启动用的 bat（扩展会自动拉起代理，这个只在调试时方便）
 proxy/*.bat
 
@@ -26,6 +37,8 @@ node_modules
 # 里面的 *.vsix 已被上面的规则挡掉，这行是防有人往 dist 里放别的文件
 dist/
 dist/**
+_testbuild/
+_testbuild/**
 .vscode
 .git
 # CI 配置与 GitHub 元数据不进包

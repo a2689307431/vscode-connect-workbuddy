@@ -38,11 +38,15 @@ const MUST_NOT_HAVE = [
   /^HANDOFF\.md$/,
   /^proxy\/PROXY\.md$/,
   /^node_modules\//,
-  /(^|\/)_[^/]*$/,   // _newver 之类的临时目录/文件
+  /(^|\/)_[^/]*$/, // _newver 之类的临时目录/文件
   /\.tgz$/,
   /\.vsix$/,
   /^scripts\//,
+  /^proxy\/tests\//,
   /(^|\/)\.git\//,
+  // 备份/临时文件（踩过：package.json.bak 被 vsce 打进了发布包）
+  /\.(bak|old|orig|rej|swp|tmp)$/,
+  /\.bak-/,
 ];
 
 /** 读 ZIP central directory，返回条目名列表 */
