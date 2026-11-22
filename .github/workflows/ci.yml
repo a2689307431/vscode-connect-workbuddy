@@ -109,47 +109,13 @@ jobs:
       - name: 打包 vsix
         run: npm run package
 
+      # ⚠️ 不用 `unzip -l`：GitHub 的 windows-latest 跑 `shell: bash` 用的是 Git-bash，
+      #    里面**没有 unzip.exe**，`unzip -l x.vsix | grep -q foo` 会永远失败，
+      #    误报成「vsix 里缺少 extension.js」（CI #6 就是这么挂的：ubuntu/macos 绿、windows 红）。
+      #    改成解析 ZIP central directory，三平台结果一致。
       - name: 包体积与内容检查
-        shell: bash
         run: |
-          set -e
-          # 打包产物统一放 dist/（跟本地保持一致）
-          vsix=$(ls dist/*.vsix | head -1)
-          size=$(wc -c < "$vsix")
-          echo "vsix: $vsix"
-          echo "大小: $size 字节（约 $((size/1024)) KB）"
-
-          # 超过 800KB 说明打进了不该打的东西（曾因上游 .tgz 涨到 3.3MB）
-          if [ "$size" -gt 800000 ]; then
-            echo "::error::vsix 超过 800KB，检查 .vscodeignore 是否漏了什么"
-            exit 1
-          fi
-          # 太小也不对：核心文件丢了
-          if [ "$size" -lt 150000 ]; then
-            echo "::error::vsix 小于 150KB，可能缺了 lib/ 或 proxy/"
-            exit 1
-          fi
-
-          # 必须包含这三个文件
-          for f in extension.js proxy/workbuddy-proxy.mjs lib/package.json; do
-            if ! unzip -l "$vsix" | grep -q "$f"; then
-              echo "::error::vsix 里缺少 $f"
-              exit 1
-            fi
-          done
-          # host-heartbeat 必须存在（名字随上游版本变，用通配）
-          if ! unzip -l "$vsix" | grep -q "host-heartbeat-"; then
-            echo "::error::vsix 里缺少 host-heartbeat 模块"
-            exit 1
-          fi
-          # 绝不能进包的
-          for f in HANDOFF.md node_modules "_newver" ".tgz"; do
-            if unzip -l "$vsix" | grep -q "$f"; then
-              echo "::error::vsix 里混进了 $f"
-              exit 1
-            fi
-          done
-          echo "✓ 包内容检查通过"
+          node scripts/verify-vsix.mjs dist/vscode-connect-workbuddy-*.vsix
 
       - name: 上传 vsix（便于下载检查）
         uses: actions/upload-artifact@v4

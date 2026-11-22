@@ -150,6 +150,6 @@
   ],
   "scripts": {
     "check:upstream": "node scripts/check-upstream.mjs",
-    "package": "node scripts/package.mjs"
+    "package": "node scripts/package.mjs && node scripts/verify-vsix.mjs dist"
   }
 }
