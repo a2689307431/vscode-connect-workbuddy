@@ -91,6 +91,13 @@ jobs:
       - name: 更新网络层（离线 mock 测试）
         run: node proxy/tests/update-net.mock.cjs
 
+      # GitHub Release 静态解析（atom feed / expanded_assets）的离线单测。
+      # GitHub API 未认证限额是按出口 IP 算的，机场共享 IP 很容易被用光，
+      # 所以限流时靠这两个静态端点兜底。它们的格式是 GitHub 私有实现，
+      # 随时可能变 —— 格式一变这里就红，不用等用户报「检查更新失败」。
+      - name: Release 静态解析（离线单测）
+        run: node proxy/tests/release-parse.test.cjs
+
       # extension.js 依赖 vscode 模块，无法直接 require；
       # 用 esbuild 之外最轻的办法：只解析不执行（--check 已覆盖），
       # 这里额外确认 package.json 关键字段齐全。

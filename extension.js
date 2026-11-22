@@ -53,6 +53,24 @@ function log(...args) {
   output.appendLine('[' + new Date().toTimeString().slice(0, 8) + '] ' + args.map(String).join(' '));
 }
 
+/**
+ * 更新路径专用日志：**无条件落盘**到 %TEMP%/workbuddy-update.log
+ *
+ * 为什么不复用 log()：
+ *   log() 受 `debug` 设置门控（默认一条不打印），而且 OutputChannel 的内容
+ *   **不落盘** —— 用户报「检查更新失败」时，远程完全拿不到证据。
+ *   更新出问题几乎必然跟网络环境有关，必须先把现场留住。
+ */
+function ulog(...args) {
+  const line = new Date().toISOString() + ' ' + args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+  try {
+    fs.appendFileSync(path.join(os.tmpdir(), 'workbuddy-update.log'), line + '\n');
+  } catch {
+    /* 落盘失败不能影响主流程 */
+  }
+  log(line);
+}
+
 // ── 代理进程管理（跟着 VS Code 生死）───────────────────────────────
 // 抄 dsh-connect-workbuddy 的 loopback shim 三个要点：
 //   1. 随机端口（listen(0)），不用固定的 8799
@@ -2391,6 +2409,7 @@ function currentVersion() {
 //    国内用户不开 TUN 时直连 api.github.com 必然超时（2026-11-23 实测）。
 
 const { parseProxy, normalizeProxyUrl, systemProxy, httpGet, readStreamAll } = require('./update-net');
+const { parseReleaseAtom, parseExpandedAssets } = require('./release-parse');
 
 /** 读某个配置节里的 proxy 字段（string） */
 function configProxyOf(section) {
@@ -2430,7 +2449,15 @@ function detectProxyUrl() {
     process.env.all_proxy ||
     '';
 
-  cachedDetectedProxy = vsCodeUsable || normalizeProxyUrl(fromEnv) || systemProxy();
+  // 系统代理探测要跑子进程（reg/scutil/gsettings），只跑一次
+  const fromSystem = systemProxy();
+  cachedDetectedProxy = vsCodeUsable || normalizeProxyUrl(fromEnv) || fromSystem;
+
+  // 把探测依据整个记下来 —— 用户报「连不上」时，这几行就能定位问题
+  ulog(
+    `代理探测：http.proxy=${JSON.stringify(fromVSCode)} env=${JSON.stringify(fromEnv)} ` +
+      `system=${JSON.stringify(fromSystem)} → 采用 ${JSON.stringify(cachedDetectedProxy || '（直连）')}`
+  );
   return cachedDetectedProxy;
 }
 
@@ -2455,23 +2482,145 @@ function invalidateProxyCache() {
 async function httpGetSmart(url, opts = {}) {
   const strictSSL = strictSSLSetting();
   const explicit = normalizeProxyUrl(configProxyOf(SECTION));
-  if (explicit) return httpGet(url, { ...opts, proxy: explicit, strictSSL });
+  const host = safeHost(url);
+
+  if (explicit) {
+    ulog(`GET ${host} → 走显式代理 ${explicit}（strictSSL=${strictSSL}）`);
+    return httpGet(url, { ...opts, proxy: explicit, strictSSL });
+  }
 
   if (preferProxy) {
     const detected = detectProxyUrl();
-    if (detected) return httpGet(url, { ...opts, proxy: detected, strictSSL });
+    if (detected) {
+      ulog(`GET ${host} → 走已探测代理 ${detected}（strictSSL=${strictSSL}）`);
+      return httpGet(url, { ...opts, proxy: detected, strictSSL });
+    }
   }
 
   try {
-    return await httpGet(url, { ...opts, proxy: '', strictSSL });
+    ulog(`GET ${host} → 尝试直连（strictSSL=${strictSSL}）`);
+    const r = await httpGet(url, { ...opts, proxy: '', strictSSL });
+    ulog(`GET ${host} → 直连成功 HTTP ${r.status}`);
+    return r;
   } catch (e) {
+    const msg = e?.message || String(e);
+    ulog(`GET ${host} → 直连失败：${msg}`);
     const detected = detectProxyUrl();
-    if (!detected) throw e;
-    log(`直连 ${new URL(url).host} 失败（${e?.message || e}），改走代理 ${detected} 重试`);
+    if (!detected) {
+      ulog(`GET ${host} → 没有探测到可用的代理，放弃`);
+      throw e;
+    }
+    ulog(`GET ${host} → 改走代理 ${detected} 重试`);
     preferProxy = true;
-    return httpGet(url, { ...opts, proxy: detected, strictSSL });
+    const r = await httpGet(url, { ...opts, proxy: detected, strictSSL });
+    ulog(`GET ${host} → 代理重试成功 HTTP ${r.status}`);
+    return r;
   }
 }
+
+/** 从 URL 里取 host（解析失败就原样返回，日志用） */
+function safeHost(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url);
+  }
+}
+
+/**
+ * 兜底：GitHub API 被限流时，改用**静态端点**查最新版本和资产。
+ *
+ * 为什么要这个：
+ *   GitHub API 的未认证配额是 **按出口 IP** 算的（60 次/小时），
+ *   机场 / 公司 NAT / 校园网的出口 IP 都是共享的，很容易被别人用光
+ *   → 403 "API rate limit exceeded"，而且一限就是一小时。
+ *
+ * 用两个**不消耗 API 配额**的端点（2026-11-23 实测，三平台行为一致）：
+ *
+ *   1. `/<repo>/releases.atom`                  → 最新 tag + 发布说明
+ *   2. `/<repo>/releases/expanded_assets/<tag>` → 资产列表（含 .vsix 文件名）
+ *
+ * 为什么不直接抓 Release 页面 HTML：
+ *   页面里的资产列表是 JS 动态插入的，静态 HTML **一个 .vsix 都没有**
+ *   （实测 149 KB 的页面里搜不到）。
+ *
+ * 解析逻辑放在 release-parse.js（纯函数，可离线单测）。
+ *
+ * 代价：拿不到 digest（atom/HTML 里都没有），只能靠 HTTPS 保护。
+ *       这一点会在弹窗里如实告诉用户，不假装有校验。
+ */
+async function fetchLatestReleaseFallback() {
+  const headers = { 'user-agent': 'Mozilla/5.0 (compatible; vscode-connect-workbuddy-updater)' };
+
+  // ── 第 1 步：atom feed → 版本号 ──────────────────────────────
+  const atomUrl = `https://github.com/${RELEASE_REPO}/releases.atom`;
+  ulog(`API 不可用，改用静态 atom feed：${atomUrl}`);
+
+  let parsed;
+  try {
+    const res = await httpGetSmart(atomUrl, { headers, timeout: 20_000 });
+    if (res.status !== 200) {
+      res.stream.resume();
+      ulog(`atom feed 失败：HTTP ${res.status}`);
+      return null;
+    }
+    const xml = (await readStreamAll(res.stream, 4 * 1024 * 1024)).toString('utf8');
+    parsed = parseReleaseAtom(xml);
+  } catch (e) {
+    ulog('atom feed 异常：' + (e?.message || e));
+    return null;
+  }
+
+  if (!parsed) {
+    ulog('atom feed 里没解析出 tag');
+    return null;
+  }
+  const { tag, version, notes, htmlUrl } = parsed;
+  ulog(`atom feed 解析成功：${tag}`);
+
+  // ── 第 2 步：expanded_assets → vsix 文件名 ──────────────────
+  const assetsUrl = `https://github.com/${RELEASE_REPO}/releases/expanded_assets/${tag}`;
+  ulog(`取资产列表：${assetsUrl}`);
+
+  let vsixName = '';
+  try {
+    const res = await httpGetSmart(assetsUrl, { headers, timeout: 20_000 });
+    if (res.status === 200) {
+      const html = (await readStreamAll(res.stream, 4 * 1024 * 1024)).toString('utf8');
+      vsixName = parseExpandedAssets(html, version);
+      ulog(`资产列表解析结果：${vsixName || '（未找到 .vsix）'}`);
+    } else {
+      res.stream.resume();
+      ulog(`expanded_assets 失败：HTTP ${res.status}`);
+    }
+  } catch (e) {
+    ulog('expanded_assets 异常：' + (e?.message || e));
+  }
+
+  // 兜底：我们一直用 vscode-connect-workbuddy-<version>.vsix 这个命名
+  if (!vsixName) {
+    vsixName = `vscode-connect-workbuddy-${version}.vsix`;
+    ulog(`按命名规则推断文件名：${vsixName}`);
+  }
+
+  // ⚠️ 用 /releases/latest/download/<name>（不是 /releases/download/<tag>/<name>）：
+  //    tag 有的带 v 有的不带，latest 别名能绕开这个差异。
+  const vsixUrl = `https://github.com/${RELEASE_REPO}/releases/latest/download/${vsixName}`;
+
+  return {
+    version,
+    vsixUrl,
+    vsixName,
+    size: 0,
+    digest: '',
+    notes: notes || '（GitHub API 限流，改从 atom feed 读取，无发布说明）',
+    htmlUrl: htmlUrl || `https://github.com/${RELEASE_REPO}/releases/tag/v${version}`,
+    // 标记来源，供 UI 提示「为什么没有 SHA256」
+    source: 'static',
+  };
+}
+
+
 
 /**
  * 查最新 Release。返回 { version, vsixUrl, digest, notes, htmlUrl } 或 null。
@@ -2488,12 +2637,28 @@ async function fetchLatestRelease() {
       timeout: 15_000,
     });
     if (res.status !== 200) {
-      res.stream.resume();
-      log(`查更新失败：HTTP ${res.status}`);
+      const body = (await readStreamAll(res.stream).catch(() => Buffer.alloc(0))).toString('utf8').slice(0, 300);
+      ulog(`查 Release 失败：HTTP ${res.status} body=${body}`);
       lastUpdateError = `HTTP ${res.status}`;
+
+      // 403/429 基本都是「未认证请求按出口 IP 限流」（机场节点是共享 IP，很容易撞上）。
+      // 这种情况 API 一天都好不了，但 Release 页面还能访问 → 换成页面解析。
+      if (res.status === 403 || res.status === 429) {
+        const rateLimited = /rate limit|too many requests/i.test(body);
+        lastUpdateError = rateLimited ? 'GitHub API 限流（共享出口 IP 用完了）' : `HTTP ${res.status}`;
+        ulog(`判定为限流=${rateLimited}，尝试 Release 页面兜底`);
+        const fallback = await fetchLatestReleaseFallback();
+        if (fallback) {
+          lastUpdateError = '';
+          return fallback;
+        }
+        lastUpdateError += '，且 Release 页面也无法解析';
+      }
       return null;
     }
-    const j = JSON.parse((await readStreamAll(res.stream)).toString('utf8'));
+    const text = (await readStreamAll(res.stream)).toString('utf8');
+    ulog(`查 Release 成功：${text.length} 字节`);
+    const j = JSON.parse(text);
     const version = String(j.tag_name || j.name || '').replace(/^v/i, '').trim();
     if (!version) return null;
 
@@ -2532,7 +2697,7 @@ async function fetchLatestRelease() {
     lastUpdateError = isCert
       ? `${raw}\n（证书校验失败。若是公司代理的自签证书，可把 VS Code 设置 http.proxyStrictSSL 设为 false）`
       : raw;
-    log('查更新异常：' + lastUpdateError);
+    ulog('查更新异常：' + raw);
     return null;
   }
 }
@@ -2550,10 +2715,12 @@ async function downloadVsix(release, progress) {
   const target = path.join(dir, release.vsixName);
 
   progress?.report({ message: '正在下载…' });
+  ulog(`下载开始：${release.vsixUrl}（期望 ${release.size} 字节，digest=${release.digest || '无'}）`);
   const res = await httpGetSmart(release.vsixUrl, {
     headers: { 'user-agent': 'vscode-connect-workbuddy-updater' },
     timeout: 120_000,
   });
+  ulog(`下载响应：HTTP ${res.status} content-length=${res.headers['content-length']}`);
   if (res.status !== 200) {
     res.stream.resume();
     throw new Error(`下载失败：HTTP ${res.status}`);
@@ -2594,6 +2761,7 @@ async function downloadVsix(release, progress) {
   }
 
   fs.writeFileSync(target, buf);
+  ulog(`下载完成：${target}（${buf.length} 字节）`);
   return target;
 }
 
@@ -2605,24 +2773,30 @@ async function downloadVsix(release, progress) {
  */
 async function checkForUpdates({ silent = false, force = false } = {}) {
   const cur = currentVersion();
+  ulog(`开始检查更新：当前 ${cur}`);
   const latest = await fetchLatestRelease();
   if (!latest) {
+    ulog(`检查更新失败：${lastUpdateError || '未知原因'}`);
     if (!silent) {
       const detected = detectProxyUrl();
       const why = lastUpdateError || '未知原因';
       const hint = detected
         ? `已探测到代理 ${detected} 但仍失败，可在设置里显式指定 \`connect-workbuddy.proxy\`。`
         : '如果你访问 GitHub 需要代理，请在设置里填 `connect-workbuddy.proxy`（如 http://127.0.0.1:7897）。';
+      const logPath = path.join(os.tmpdir(), 'workbuddy-update.log');
       void vscode.window
-        .showWarningMessage(`WorkBuddy：检查更新失败 — ${why}`, '查看日志', '打开设置')
+        .showWarningMessage(`WorkBuddy：检查更新失败 — ${why}`, '查看日志', '打开设置', '打开日志文件')
         .then((pick) => {
           if (pick === '查看日志') vscode.commands.executeCommand(`${SECTION}.showLogs`);
           else if (pick === '打开设置') {
             vscode.commands.executeCommand('workbench.action.openSettings', 'connect-workbuddy.proxy');
+          } else if (pick === '打开日志文件') {
+            vscode.commands.executeCommand('vscode.open', vscode.Uri.file(logPath));
           }
         });
       output.appendLine(`[更新] 检查失败：${why}`);
       output.appendLine(`[更新] ${hint}`);
+      output.appendLine(`[更新] 排查日志：${logPath}`);
     }
     return { status: 'error', error: lastUpdateError };
   }
@@ -2652,11 +2826,14 @@ async function checkForUpdates({ silent = false, force = false } = {}) {
   const detail = [
     `当前版本：${cur}`,
     `最新版本：${latest.version}`,
-    latest.digest ? '安装前会校验 SHA256' : '⚠ 该 Release 未提供 SHA256，仅靠 HTTPS 保护',
+    latest.digest
+      ? '安装前会校验 SHA256'
+      : latest.source === 'static'
+        ? '⚠ GitHub API 限流，信息来自静态页面，无法校验 SHA256（仅靠 HTTPS）'
+        : '⚠ 该 Release 未提供 SHA256，仅靠 HTTPS 保护',
     '',
     latest.notes ? latest.notes.slice(0, 800) : '（无发布说明）',
   ].join('\n');
-
   const pick = await vscode.window.showInformationMessage(
     `WorkBuddy 有新版本 ${latest.version}`,
     { modal: true, detail },

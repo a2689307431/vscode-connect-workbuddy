@@ -27,6 +27,7 @@ const MAX_BYTES = 800 * 1024;
 const MUST_HAVE = [
   'extension.js',
   'update-net.js',
+  'release-parse.js',
   'package.json',
   'proxy/workbuddy-proxy.mjs',
   'lib/package.json',
