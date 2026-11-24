@@ -535,21 +535,48 @@ async function doCheckin({ silent = false, ids = null, region = null } = {}) {
       }).join('\n')
       : '还没有登录任何账号。';
 
+    // 明细一律进输出面板 —— toast 只有一行，塞得下就只有「成功 N 个」这种摘要
+    if (results.length) {
+      output.appendLine('── 签到明细 ──');
+      for (const line of detail.split('\n')) output.appendLine('  ' + line);
+    }
+
     if (!results.length) {
       await vscode.window.showInformationMessage(
         'WorkBuddy：还没有登录账号，先执行「WorkBuddy: 登录账号」',
         { modal: true, detail }
       );
     } else if (failed.length && !claimed.length && !already.length) {
-      await vscode.window.showErrorMessage('WorkBuddy：签到失败', { modal: true, detail });
+      // 全失败是异常，保留对话框引人注意，但明细走 toast 的按钮
+      void vscode.window
+        .showErrorMessage(
+          `WorkBuddy：${failed.length} 个账号签到失败`,
+          '查看详情',
+          '显示日志'
+        )
+        .then((pick) => {
+          if (pick === '查看详情') {
+            void vscode.window.showInformationMessage(detail, { modal: true });
+          } else if (pick === '显示日志') {
+            output.show();
+          }
+        });
     } else {
+      // 累加所有账号的签到收益 —— 早先只取 claimed[0].credit，
+      // 4 个账号各 +100 时会显示「+100」，看着像总数，是误导。
+      const totalGain = claimed.reduce((sum, r) => sum + (Number(r.credit) || 0), 0);
       const headline = claimed.length
         ? `WorkBuddy：签到成功 ${claimed.length} 个账号` +
-          (claimed[0]?.credit ? `，+${claimed[0].credit} 积分` : '')
+          (totalGain > 0 ? `，+${totalGain} 积分` : '')
         : failed.length
           ? `WorkBuddy：${failed.length} 个账号签到失败`
           : 'WorkBuddy：今天已经签过了';
-      await vscode.window.showInformationMessage(headline, { modal: true, detail });
+      // 非阻塞 toast —— 不挡住用户，明细点「详情」再看
+      void vscode.window.showInformationMessage(headline, '详情').then((pick) => {
+        if (pick === '详情') {
+          void vscode.window.showInformationMessage(detail, { modal: true });
+        }
+      });
     }
   }
   return { claimed, already, failed, results };
@@ -770,21 +797,6 @@ function setStatusBar(state, text, tooltip, command = 'connect-workbuddy.showCre
   }
 }
 
-/** 状态栏 tooltip 里的账号池概览。只读快照，不额外打上游。 */
-function appendPoolTooltip(tip) {
-  const { accounts, total, partial } = poolSnapshot;
-  if (!accounts.length) return;
-  const head = total === null
-    ? '合计 —'
-    : `合计 **${formatCredits(total)}**${partial ? '+' : ''}`;
-  tip.appendMarkdown(`---\n\n**账号池** ${accounts.length} 个账号 · ${head}\n\n`);
-  for (const a of accounts) {
-    const n = formatCredits(a.credits);
-    const mark = a.id === trackedAccountId ? ' ←' : '';
-    tip.appendMarkdown(`· ${a.name || a.id}：${n === null ? '—' : n}${mark}\n\n`);
-  }
-}
-
 /** 刷新状态栏上的积分。失败也不弹窗，只把状态栏变红。 */
 function refreshCreditsStatus({ quiet = false, force = false } = {}) {
   const wantAccount = trackedAccountId || null;
@@ -813,15 +825,20 @@ function refreshCreditsStatus({ quiet = false, force = false } = {}) {
       const low = c.total <= 0;
       const soon = typeof c.expiringSoon === 'number' && c.expiringSoon > 0;
       const label = c.accountName || c.accountId || '当前账号';
-      const tip = new vscode.MarkdownString();
-      tip.appendMarkdown(`**WorkBuddy 剩余积分**：${num}\n\n`);
-      tip.appendMarkdown(`账号：\`${label}\` · ${REGION_LABEL[normRegion(c.region)] || '国内站'}\n\n`);
+      // tooltip 只放「余额 / 账号 / 最近到期 / 点击提示」四样东西。
+      // 账号池明细在钱包里看 —— 悬停铺一屏（旧的要 21 行）太吵。
+      const tipParts = [`**${num}** 积分 · \`${label}\``];
       if (c.nearestExpiry) {
-        tip.appendMarkdown(`最近到期：${new Date(c.nearestExpiry).toLocaleString()}\n\n`);
+        const days = calendarDaysUntil(c.nearestExpiry);
+        // 日期解析失败（NaN）就别显示 —— 否则会渲染成「NaN 天后积分到期」
+        if (Number.isFinite(days)) {
+          const when = days <= 0 ? '今天' : `${days} 天后`;
+          const amount = soon ? `（${formatCredits(c.expiringSoon)} 分）` : '';
+          tipParts.push(`${days <= 7 ? '⚠️ ' : ''}${when}积分到期${amount}`);
+        }
       }
-      if (soon) tip.appendMarkdown(`⚠️ 其中 ${formatCredits(c.expiringSoon)} 将在 30 天内过期\n\n`);
-      appendPoolTooltip(tip);
-      tip.appendMarkdown('---\n\n_点击打开钱包（账号池总览 → 单个账号明细）_');
+      tipParts.push('_点击打开钱包_');
+      const tip = new vscode.MarkdownString(tipParts.join('\n\n'));
       // 带账号名，否则两个账号余额相近时根本分不清现在显示的是谁
       const shortName = shortenAccountName(label);
       const text = shortName
@@ -829,7 +846,8 @@ function refreshCreditsStatus({ quiet = false, force = false } = {}) {
         : `$(credit-card) ${num}`;
       setStatusBar(low ? 'warn' : 'ok', text, tip);
       if (!quiet) log(`积分刷新：${num}（${label}）`);
-      // tooltip 里的账号池过期了就在后台补一次（不阻塞状态栏更新）
+      // tooltip 只显示当前账号，不再需要账号池快照；
+      // 但钱包打开时仍要用，所以按原来的节奏在后台补一次。
       if (!poolSnapshot.accounts.length || Date.now() - poolSnapshot.at >= POOL_TTL_MS) {
         refreshPoolSnapshot().catch(() => {});
       }
@@ -1363,6 +1381,20 @@ async function autoSyncGroups(context, { silent = true } = {}) {
 
 const SEP = vscode.QuickPickItemKind.Separator;
 
+/** decodeURIComponent 遇到畸形转义会抛 —— 响应头里的账号名不该把整个请求带崩 */
+function safeDecode(s) {
+  try {
+    return decodeURIComponent(String(s || ''));
+  } catch {
+    return String(s || '');
+  }
+}
+
+// 换号提醒的去重状态：同一对「A → B」10 分钟内只弹一次。
+// 否则用户选中一个欠费账号后，每条消息都会弹一次警告。
+const FAILOVER_NOTICE_TTL_MS = 10 * 60_000;
+let lastFailoverNotice = { pair: '', at: 0 };
+
 function fmtTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -1373,6 +1405,63 @@ function fmtDay(iso) {
   if (!iso) return '';
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('zh-CN');
+}
+
+/**
+ * 距离 `iso` 还有几个「自然日」（今天 = 0，明天 = 1）。
+ *
+ * 为什么不用 `ceil((ms - now) / 86400000)`：
+ *   · 「1 小时后到期」会被算成「1 天后」，吓人且不准
+ *   · 用日历日差，「今天到期」就是今天，「明天到期」就是明天，和用户的直觉一致
+ * 用 Math.round 而不是 floor，是为了抵消夏令时造成的 ±1 小时偏移。
+ * 无法解析时返回 NaN（调用方按「没有」处理）。
+ */
+function calendarDaysUntil(iso) {
+  const ms = new Date(iso).getTime();
+  if (Number.isNaN(ms)) return NaN;
+  const startOfDay = (t) => {
+    const d = new Date(t);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  };
+  return Math.round((startOfDay(ms) - startOfDay(Date.now())) / 86_400_000);
+}
+
+/**
+ * 总览里每个账号的「积分会过期吗」提示。
+ *
+ * 数据来自代理 `/accounts?credits=1` 的 `nearestExpiry` —— 上游 fetchCredits()
+ * 只统计**非月付**积分包（月付包是「每月重置」，不算浪费），且已排除
+ * 「已用完」和「已过期」的包。所以：
+ *   nearestExpiry = null  → 没有会作废的积分（全月付 / 已用尽），不需要提醒
+ *   nearestExpiry 有值    → 那天这些积分就废了，越近越要提醒
+ *
+ * 分档（按剩余天数）：
+ *   ≤ 7 天   → ⚠️ 红字催，标出还剩多少分要作废
+ *   ≤ 30 天  → 提一句，不吓人
+ *   > 30 天  → 只给日期，正常
+ */
+function packageExpiryHint(account) {
+  if (account.credits == null) {
+    return account.creditError ? '积分读取失败' : '';
+  }
+  const iso = account.nearestExpiry;
+  if (!iso) return ''; // 没有会过期的积分包，这行就空着（不占位）
+
+  const days = calendarDaysUntil(iso);
+  if (!Number.isFinite(days)) return '';
+  if (new Date(iso).getTime() <= Date.now()) return ''; // 已过期：上游已排除这类包，防御一下
+  const date = fmtDay(iso);
+
+  // formatCredits 对非法值返回 null，不能直接塞进模板串（会显示 "null 分"）
+  const soonNum = Number(account.expiringSoon) || 0;
+  const soonText = soonNum > 0 ? formatCredits(soonNum) : null;
+  const amount = soonText ? `（${soonText} 分）` : '';
+
+  if (days <= 0) return `⚠️ 积分今天到期${amount}`;
+  if (days <= 7) return `⚠️ ${days} 天后积分到期${amount}`;
+  if (days <= 30) return `${days} 天后最早到期 ${date}${amount}`;
+  return `最早到期 ${date}`;
 }
 
 /** 积分包 → 每个包一行（QuickPickItem）。 */
@@ -1415,7 +1504,9 @@ function formatWalletDetail(account, detail, checkin) {
         (p.detail ? `（${p.detail}）` : ''));
     }
   }
-  if (account.tokenExpiresAt) lines.push('', `token 到期：${fmtTime(account.tokenExpiresAt)}`);
+  if (account.tokenExpiresAt) {
+    lines.push('', `token 到期：${fmtTime(account.tokenExpiresAt)}（到期会自动刷新，无需操作）`);
+  }
   return lines.join('\n');
 }
 
@@ -1425,10 +1516,17 @@ async function walletOverview(accounts, checkinMap) {
   for (const a of accounts) {
     const credit = formatCredits(a.credits);
     const marks = [];
+    // 只标「状态栏跟踪」——「代理当前账号」(a.isCurrent) 对用户没有行动价值：
+    // 从下拉框选的模型永远带 @accountId| 前缀，一定锁定到具体账号，
+    // 只有裸模型名（老客户端 / 手动 curl）才会落到默认账号上。
     if (a.id === trackedAccountId) marks.push('状态栏跟踪');
-    else if (a.isCurrent) marks.push('代理当前账号');
     const ck = checkinMap.get(a.id);
-    if (ck?.checkedIn) marks.push(`已签 ${ck.streakDays || 1} 天`);
+    // streakDays 是「连续天数」（上游字段 streak_days），不是累计次数。
+    // 别简写成「已签 N 天」——那看着像总共签了多少天。
+    if (ck?.checkedIn) marks.push(`连签 ${ck.streakDays || 1} 天`);
+    // 冷却中：这个账号刚失败过，请求会优先落到别的账号上。
+    // 只在本进程观察到（内存态），重启代理就清空 —— 用来解释「为什么没走我选的账号」。
+    if (a.cooldownSec > 0) marks.push(`冷却 ${Math.ceil(a.cooldownSec / 60)} 分钟`);
     items.push({
       id: `acc|${a.region}|${a.id}`,
       acc: a,
@@ -1439,8 +1537,7 @@ async function walletOverview(accounts, checkinMap) {
       detail: [
         REGION_LABEL[a.region] || a.region,
         a.domain,
-        a.tokenExpiresAt ? `token 到期 ${fmtDay(a.tokenExpiresAt)}` : '',
-        a.credits == null && a.creditError ? '积分读取失败' : '',
+        packageExpiryHint(a),
       ].filter(Boolean).join(' · '),
     });
   }
@@ -1462,7 +1559,8 @@ async function walletOverview(accounts, checkinMap) {
       (total === null ? '' : ` · 合计 ${formatCredits(total)}${poolSnapshot.partial ? '+' : ''} 积分`),
     placeHolder: '选一个账号看明细，或选下面的操作',
     matchOnDescription: true,
-    ignoreFocusOut: true,
+    // 不设 ignoreFocusOut：默认行为就是「点到列表外任何地方就关闭」。
+    // 设 true 会让列表失焦后粘住不走，只能按 Esc —— 顶在最前面非常难受。
   });
 }
 
@@ -1493,8 +1591,8 @@ async function walletAccountDetail(account, { force = true, checkin = null } = {
     label: '$(credit-card) 剩余合计',
     description: credit === null ? '—' : `${credit} 积分`,
     detail: [
-      detail?.nearestExpiry ? `最近到期 ${fmtTime(detail.nearestExpiry)}` : '',
-      expiring > 0 ? `⚠️ ${formatCredits(expiring)} 将在 30 天内过期` : '',
+      detail?.nearestExpiry ? `最早积分到期 ${fmtTime(detail.nearestExpiry)}` : '',
+      expiring > 0 ? `⚠️ ${formatCredits(expiring)} 将在 30 天内作废` : '',
       REGION_LABEL[account.region] || account.region,
       account.domain,
     ].filter(Boolean).join(' · ') || undefined,
@@ -1534,9 +1632,12 @@ async function walletAccountDetail(account, { force = true, checkin = null } = {
   const pick = await vscode.window.showQuickPick(items, {
     title: `${account.name || account.id} · ${REGION_LABEL[account.region] || account.region}`,
     placeHolder: credit === null ? '积分 —' : `剩余 ${credit} 积分`,
-    ignoreFocusOut: true,
+    // 不设 ignoreFocusOut：点列表外 / 按 Esc 直接关闭整个钱包。
+    // 想回上一级请点第一行「← 返回账号池」——两者语义不同：
+    //   Esc / 点空白 = 「我不想看了」→ 全关
+    //   ← 返回账号池 = 「换个账号看」→ 回总览
   });
-  if (!pick) return { action: 'back', detail };
+  if (!pick) return { action: 'close', detail };
   return { action: pick.got || 'stay', detail };
 }
 
@@ -1584,12 +1685,18 @@ async function showWallet(context) {
       let force = true;
       let checkin = checkinMap.get(account.id) ?? null;
       let detail = null;
+      let closeAll = false;
       for (;;) {
         const r = await walletAccountDetail(account, { force, checkin });
         force = false;
         const action = r.action;
         if (r.detail) detail = r.detail;
+        // 「← 返回账号池」→ 回总览；Esc / 点空白 → 整个关掉
         if (action === 'back') break;
+        if (action === 'close') {
+          closeAll = true;
+          break;
+        }
         if (action === 'stay' || action === 'info') continue;
         if (action === 'refresh') { force = true; continue; }
         if (action === 'copy') {
@@ -1631,6 +1738,8 @@ async function showWallet(context) {
           continue;
         }
       }
+      // 明细页按 Esc / 点空白 → 直接关掉钱包，不回总览
+      if (closeAll) return;
       continue;
     }
 
@@ -2236,6 +2345,27 @@ class WorkBuddyProvider {
           ? '\n登录可能已失效：命令面板 → 「WorkBuddy: 登录账号」重新登录。'
           : '';
         throw new Error(`WorkBuddy 返回 HTTP ${res.status}: ${String(msg).slice(0, 500)}${hint}`);
+      }
+
+      // 代理发现「本要用你选的账号，但它在冷却/不可用，自动换了一个」时，
+      // 会在这两个头里说明。必须告诉用户 —— 换号意味着消耗另一个账号的积分。
+      //
+      // ⚠️ 但必须去重：用户选中的账号一旦欠费/失效，后面每一轮对话都会被换号。
+      //    不去重就是「每发一条消息弹一次警告」，几轮下来全是红条。
+      //    同一个「A → B」组合 10 分钟内只提醒一次。
+      const foFrom = res.headers.get('x-wb-failover-from');
+      const foTo = res.headers.get('x-wb-failover-to');
+      if (foFrom && foTo) {
+        const from = safeDecode(foFrom);
+        const to = safeDecode(foTo);
+        log(`[换号] ${from} → ${to}`);
+        const pair = `${from}\u0000${to}`;
+        if (pair !== lastFailoverNotice.pair || Date.now() - lastFailoverNotice.at > FAILOVER_NOTICE_TTL_MS) {
+          lastFailoverNotice = { pair, at: Date.now() };
+          void vscode.window.showWarningMessage(
+            `WorkBuddy：「${from}」暂时不可用，已自动改用「${to}」继续（消耗的是后者的积分）`
+          );
+        }
       }
 
       const pendingToolCalls = new Map();

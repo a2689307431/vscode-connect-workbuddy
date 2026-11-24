@@ -771,6 +771,149 @@ async function pickCurrentAccount(region, accounts) {
   return accounts.find((a) => a.selected === true) || accounts[0];
 }
 
+// ── 账号冷却（多账号自动切换用）────────────────────────────────────────────
+//
+// 为什么需要：带 `@accountId|` 前缀的请求只锁定一个账号，它一旦限流/欠费就整个失败。
+// 用户点了「193 的 deepseek」，193 恰好不能用，应该自动顶上 191 的同名模型
+// （会弹通知告知），而不是让他自己去下拉框里重选。
+//
+// 设计取舍：
+//   · **只存内存**，进程重启即清空。这是有意的 —— 冷却是一种瞬时状态，
+//     持久化反而会在「用户第二天才用」时把已经恢复的账号继续挡在外面。
+//   · 每种错误类型冷却时长不同（见 COOLDOWN_RULES）。只冷却「换号能解决」的类型：
+//     session_dead / account_restricted / hard_credit / soft_rate / model_busy / model_queue
+//   · 401 不在这里处理 —— 调用点已经会刷 token 重试一轮，仍失败才算这个账号暂时不可用。
+//
+// key 是 `${region}:${accountId}`。
+const COOLDOWN_RULES = {
+  // kind → 冷却毫秒数
+  session_dead: 10 * 60_000, // 登录失效：等用户重登，10 分钟内别再打
+  account_restricted: 30 * 60_000, // 账号被限制：长冷却
+  hard_credit: 60 * 60_000, // 积分用尽：1 小时（月中用尽的账号基本不会自己恢复）
+  soft_rate: 60_000, // 请求太频繁：1 分钟就够（上游按分钟滑动窗口）
+  model_busy: 30_000, // 模型繁忙：短冷却
+  model_queue: 30_000, // 排队中：短冷却
+};
+const cooldownMap = new Map(); // key → { until, kind, at }
+
+function cooldownKey(region, accountId) {
+  return `${region}:${accountId}`;
+}
+
+/** 这个账号现在可以试吗？ */
+function isCoolingDown(region, accountId) {
+  const e = cooldownMap.get(cooldownKey(region, accountId));
+  if (!e) return false;
+  if (Date.now() >= e.until) {
+    cooldownMap.delete(cooldownKey(region, accountId));
+    return false;
+  }
+  return true;
+}
+
+/** 剩余冷却秒数（0 表示没在冷却）。 */
+function cooldownRemainingSec(region, accountId) {
+  const e = cooldownMap.get(cooldownKey(region, accountId));
+  if (!e) return 0;
+  const left = e.until - Date.now();
+  return left > 0 ? Math.ceil(left / 1000) : 0;
+}
+
+/** 记一次失败。只有 COOLDOWN_RULES 里列出的 kind 才冷却。 */
+function markCooldown(region, accountId, kind) {
+  const ms = COOLDOWN_RULES[kind];
+  if (!ms || !accountId) return false;
+  cooldownMap.set(cooldownKey(region, accountId), {
+    until: Date.now() + ms,
+    kind,
+    at: Date.now(),
+  });
+  log(`账号 ${accountId} 进入冷却 ${Math.round(ms / 1000)}s（${kind}）`);
+  return true;
+}
+
+/** 请求成功后清掉这个账号的冷却（防止过期状态一直挂着）。 */
+function clearCooldown(region, accountId) {
+  if (accountId) cooldownMap.delete(cooldownKey(region, accountId));
+}
+
+/** 这个错误类型值得换号再试吗？ */
+function isFailoverableKind(kind) {
+  return Object.prototype.hasOwnProperty.call(COOLDOWN_RULES, kind);
+}
+
+/** 这些分类说明「请求本身就不该被接受」，换账号只会把同样的内容再发一遍。 */
+const ABORT_KINDS = new Set(['policy_reject']);
+
+// 测试钩子：WB_TEST_COOLDOWN=<accountId>[,<accountId>] 启动时把这些账号直接标成
+// 「积分用尽」冷却。**只在排查时用** —— 无法稳定复现上游 429，靠它验证换号链路。
+// 不设置这个环境变量时代码路径完全不存在，对正常使用零影响。
+if (process.env.WB_TEST_COOLDOWN) {
+  for (const id of process.env.WB_TEST_COOLDOWN.split(',').map((s) => s.trim()).filter(Boolean)) {
+    markCooldown('cn', id, 'hard_credit');
+    markCooldown('global', id, 'hard_credit');
+    log(`[测试钩子] 账号 ${id} 已被标记为冷却`);
+  }
+}
+
+// 测试钩子：WB_TEST_FAIL=<accountId>[:<次数>][,<accountId>[:<次数>]...]
+//   让指定账号的前 N 次（默认 1）chat 请求直接返回合成的 `hard_credit` 失败。
+//   和 WB_TEST_COOLDOWN 互补：那个测「已知冷却 → 直接换号」，
+//   这个测「先试了、运行时才失败 → 换号」（更常见，也更难自然复现）。
+// 同样是环境变量守卫，不设置就完全不存在。
+const testFailPlan = new Map(); // accountId → 剩余要失败几次
+if (process.env.WB_TEST_FAIL) {
+  for (const spec of process.env.WB_TEST_FAIL.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const [id, times] = spec.split(':');
+    const n = Number(times);
+    if (id) testFailPlan.set(id, Number.isFinite(n) && n > 0 ? Math.floor(n) : 1);
+  }
+  if (testFailPlan.size) log(`[测试钩子] 将强制失败的账号：${[...testFailPlan.keys()].join(', ')}`);
+}
+
+/** 消耗一次「强制失败」额度；返回 true 表示这次请求应该被合成失败。 */
+function consumeTestFail(accountId) {
+  if (!testFailPlan.size) return false;
+  const left = testFailPlan.get(accountId) || 0;
+  if (left <= 0) return false;
+  testFailPlan.set(accountId, left - 1);
+  log(`[测试钩子] 账号 ${accountId} 强制失败（剩余额度 ${left - 1}）`);
+  return true;
+}
+
+/** 造一个假的失败响应，形状和 fetchChat 返回的一致（带 wbKind）。 */
+function synthFailure(kind) {
+  const status = kind === 'hard_credit' ? 402 : kind === 'soft_rate' ? 429 : 500;
+  const res = new Response(
+    JSON.stringify({ error: { message: `[test-hook] synthetic ${kind}` } }),
+    { status, headers: { 'content-type': 'application/json; charset=utf-8' } }
+  );
+  res.wbKind = kind;
+  return res;
+}
+
+// ── 换号通知 ──────────────────────────────────────────────────────────────
+// 「本要用 A，结果切到了 B」这个事实要传给扩展，让它弹个通知告诉用户
+// （用户明确选了 A 的模型，换成 B 意味着消耗另一个账号的积分，不能瞒着）。
+//
+// 为什么用 WeakMap 而不是直接挂属性：Response 对象的可扩展性没有 API 保证，
+// 用 WeakMap 无论对象 frozen 与否都能记；也不污染对象本身。
+const failoverNotes = new WeakMap();
+
+function rememberFailover(res, info) {
+  try {
+    failoverNotes.set(res, info);
+  } catch { /* 极端情况下忽略 */ }
+}
+
+function readFailover(res) {
+  try {
+    return failoverNotes.get(res) || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── OAuth 登录（无需 WorkBuddy 桌面客户端，跨平台）──────────────────────────
 // 照抄 dsh-connect-workbuddy 的 src/oauth.ts：
 //   ① POST {base}/v2/plugin/auth/state?platform=workbuddy  → state + authUrl
@@ -961,7 +1104,7 @@ async function oauthPoll(loginId, region = 'cn') {
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────
-function send(res, code, obj) {
+function send(res, code, obj, extraHeaders = null) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
     'content-type': 'application/json; charset=utf-8',
@@ -969,8 +1112,19 @@ function send(res, code, obj) {
     'access-control-allow-origin': '*',
     'access-control-allow-headers': '*',
     'access-control-allow-methods': 'GET,POST,OPTIONS',
+    ...(extraHeaders || {}),
   });
   res.end(body);
+}
+
+/** 把「换号」事实变成响应头（没有换号就返回空对象）。 */
+function failoverHeaders(up) {
+  const fo = readFailover(up);
+  if (!fo) return {};
+  return {
+    'x-wb-failover-from': encodeURIComponent(fo.fromName || fo.fromId || ''),
+    'x-wb-failover-to': encodeURIComponent(fo.toName || fo.toId || ''),
+  };
 }
 
 function readBody(req) {
@@ -1030,25 +1184,6 @@ const modelState = {
   global: { ids: null, catalog: null, verified: null },
 };
 
-// 下面两个保留原名（旧代码引用很多），它们始终指向「最近处理的那个区域」的
-// 数据。跨区域混用的风险已经由 refreshModelIds / verifyModels 的显式 region
-// 参数消除。
-let realModelIds = null;   // Set<id>
-let catalogModels = null;  // 完整元数据
-
-function useRegion(region = 'cn') {
-  const st = modelState[region] ?? modelState.cn;
-  realModelIds = st.ids;
-  catalogModels = st.catalog;
-  return st;
-}
-
-function saveRegion(region = 'cn') {
-  const st = modelState[region] ?? modelState.cn;
-  st.ids = realModelIds;
-  st.catalog = catalogModels;
-  return st;
-}
 let verifiedIds = null;    // 实测 200 的 id 集合（可选，用于标注）
 
 // ↓↓↓ 以下筛选规则照抄 dsh-connect-workbuddy（host-heartbeat-*.js）↓↓↓
@@ -1098,7 +1233,6 @@ function knownModelIds(region = 'cn') {
   const raw = fallbackModelsFor(region);
   const ids = raw.map((m) => (typeof m === 'string' ? m : (m?.id ?? m?.name ?? ''))).filter(Boolean);
   st.ids = new Set(ids);
-  realModelIds = st.ids;
   return st.ids;
 }
 
@@ -1129,9 +1263,6 @@ async function refreshModelIds(region = 'cn') {
       const st = modelState[region] ?? modelState.cn;
       st.catalog = selected;
       st.ids = new Set(selected.map((m) => m.id));
-      // 同步「最近区域」别名，兼容旧引用
-      catalogModels = st.catalog;
-      realModelIds = st.ids;
       const media = selected.filter((m) => (m.tags ?? []).some((t) => MEDIA_TAGS.includes(t)));
       const chat = selected.filter((m) => !media.includes(m));
       log(`[${region}] 已同步 ${selected.length} 个模型（chat ${chat.length} / 媒体 ${media.length}）：`);
@@ -1406,25 +1537,38 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
   // ④ 选定账号：带前缀就锁定指定账号，否则用「当前账号」——不轮询
   const p = pool[region];
   let targets;
+  // primary = 用户明确指定的那个账号（只有带前缀时才有）。
+  // 请求最后落在 primary 之外的账号上，就算「换号」，要通知客户端。
+  let primary = null;
 
   if (forcedAccountId) {
     const hit = accounts.find((a) => a.id === forcedAccountId);
     if (hit) {
-      targets = [hit];
-      log(`指定账号「${hit.accountName}」`);
+      // 用户明确选了这个账号的模型。它优先；不能用时自动顶上别的账号。
+      // ⚠️ 这里必须一次性把候选列表铺全（而不是只给 [hit]）——
+      //    因为「先试 hit，运行时才失败」才是最常发生的情况，
+      //    光有 [hit] 的话循环跑完一轮就没了，根本走不到换号。
+      primary = hit;
+      targets = [hit, ...accounts.filter((a) => a.id !== hit.id)];
+      log(`指定账号「${hit.accountName}」（共 ${targets.length} 个候选）`);
     } else {
       log(`指定账号 ${forcedAccountId} 已不存在，退回当前账号`);
       targets = accounts;
     }
   } else {
     targets = accounts;
+    // 把「当前账号」排到最前面，其余作为失败兜底
+    const current = await pickCurrentAccount(region, accounts);
+    if (current) targets = [current, ...accounts.filter((a) => a.id !== current.id)];
   }
 
-  // 把「当前账号」排到最前面，其余作为失败兜底
-  const current = await pickCurrentAccount(region, accounts);
-  if (current && !forcedAccountId) {
-    targets = [current, ...accounts.filter((a) => a.id !== current.id)];
+  // 把冷却中的账号挪到队尾，但**不删** —— 全都在冷却时还得有人干活。
+  // 这样「已知不能用」的账号不会白花一次往返，「说不定已经恢复」的仍有机会。
+  const cooled = (a) => isCoolingDown(region, a.id);
+  if (primary && cooled(primary) && targets.length > 1) {
+    log(`指定账号「${primary.accountName}」正在冷却，优先用其它账号兜底`);
   }
+  targets = [...targets.filter((a) => !cooled(a)), ...targets.filter(cooled)];
 
   const n = targets.length;
   let lastRes = null;
@@ -1432,6 +1576,8 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
 
   for (let i = 0; i < n; i++) {
     const acct = targets[i];
+    // 本账号最后一次响应（和跨账号的 lastRes 分开，避免 A 的失败类型被算到 B 头上）
+    let acctRes = null;
 
     let cred;
     try {
@@ -1452,7 +1598,9 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
     for (let same = 0; same < 3; same++) {
       let res;
       try {
-        res = await fetchChat(cred, bodyForAttempt);
+        res = consumeTestFail(acct.id)
+          ? synthFailure('hard_credit')
+          : await fetchChat(cred, bodyForAttempt);
       } catch (e) {
         lastErr = e;
         break;
@@ -1460,10 +1608,24 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
 
       if (res.ok) {
         p.lastUsed = acct.id;
+        // 成功了：清掉这个账号可能残留的冷却状态，
+        // 否则「限流 1 分钟」到期前如果它自己恢复了，会被无谓地排到队尾。
+        clearCooldown(region, acct.id);
         if (n > 1 || forcedAccountId) log(`✓ 账号「${acct.accountName}」`);
+        // 用户指定的账号没能用上、最终落在别的账号 → 告诉调用方（会转成响应头，扩展弹通知）
+        if (primary && primary.id !== acct.id) {
+          log(`↪ 换号：${primary.accountName} → ${acct.accountName}`);
+          rememberFailover(res, {
+            fromId: primary.id,
+            fromName: primary.accountName,
+            toId: acct.id,
+            toName: acct.accountName,
+          });
+        }
         return res;
       }
 
+      acctRes = res;
       lastRes = res;
 
       // 401/403 或分类为「凭据已死」→ 刷新这个账号的 token 再试一次
@@ -1496,7 +1658,18 @@ async function callUpstream(bodyObj, region = 'cn', retryOn401 = true) {
       break;
     }
 
-    if (n > 1) log(`账号「${acct.accountName}」不可用（HTTP ${lastRes?.status}），换下一个`);
+    // 这个账号彻底不可用了 —— 记一次冷却（只对「换号能解决」的类型生效），
+    // 下次请求就会优先用别的账号，不用再白花一次往返。
+    if (acctRes && isFailoverableKind(acctRes.wbKind)) {
+      markCooldown(region, acct.id, acctRes.wbKind);
+    }
+    // 请求本身被拒（内容安全策略）→ 换账号也是同样结果，直接收工，
+    // 不要把同一段内容往每个账号上都发一遍。
+    if (acctRes && ABORT_KINDS.has(acctRes.wbKind)) {
+      log(`账号「${acct.accountName}」返回 ${acctRes.wbKind}，属请求级拒绝，不再换号`);
+      break;
+    }
+    if (n > 1) log(`账号「${acct.accountName}」不可用（HTTP ${acctRes?.status ?? lastRes?.status}），换下一个`);
   }
 
   if (lastRes) return lastRes;
@@ -1664,6 +1837,43 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, info);
     }
 
+    // ── 测试钩子控制端点（只在 WB_TEST_HOOKS=1 时挂载）──────────────────────
+    // 为什么需要：换号的两种触发方式（「已知冷却」和「先试了才失败」）都得能
+    // 稳定复现才测得了。预置环境变量只能覆盖前者，且会在第一次请求就生效，
+    // 没法先测「正常情况下不换号」。所以给一个运行时开关：
+    //   POST /__test/hook { "fail": "<accountId>[:<次数>]" }  → 让该账号下次失败
+    //   POST /__test/hook { "cooldown": "<accountId>[:<kind>]" } → 直接标记冷却
+    //   POST /__test/hook { "clear": true }                   → 清空冷却与失败额度
+    // 端口只监听本机，且必须显式设 WB_TEST_HOOKS=1，正常运行时这个分支不存在。
+    if (p === '/__test/hook' && req.method === 'POST' && process.env.WB_TEST_HOOKS === '1') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      let j = {};
+      try { j = JSON.parse(raw || '{}'); } catch { /* 忽略畸形体 */ }
+      const out = { ok: true };
+      if (j.clear) {
+        cooldownMap.clear();
+        testFailPlan.clear();
+        out.cleared = true;
+      }
+      if (j.fail) {
+        const [id, times] = String(j.fail).split(':');
+        const n = Number(times);
+        if (id) testFailPlan.set(id, Number.isFinite(n) && n > 0 ? Math.floor(n) : 1);
+        out.fail = id ? { id, times: testFailPlan.get(id) } : null;
+      }
+      if (j.cooldown) {
+        const [id, kind] = String(j.cooldown).split(':');
+        if (id) {
+          markCooldown('cn', id, kind || 'hard_credit');
+          markCooldown('global', id, kind || 'hard_credit');
+        }
+        out.cooldown = id ? { id, kind: kind || 'hard_credit' } : null;
+      }
+      log(`[测试钩子] /__test/hook → ${JSON.stringify(out)}`);
+      return send(res, 200, out);
+    }
+
     // 账号列表
     //   ?credits=1  顺手把每个账号的剩余积分一起带上（并行请求，单个失败不影响其它）
     if (p === '/accounts' && req.method === 'GET') {
@@ -1707,7 +1917,20 @@ const server = http.createServer(async (req, res) => {
             isCurrent: a.id === current?.id,
             tokenExpiresAt: a.tokenExpiresAtMs ? new Date(a.tokenExpiresAtMs).toISOString() : null,
             isLastUsed: a.id === pool[region].lastUsed,
-            ...(withCredits ? { credits: c ? c.total : null, creditError: c ? null : '读取失败' } : {}),
+            // 冷却中（近期刚失败过，暂时轮到别的账号顶上）。
+            // 只在内存里，是本进程观察到的瞬时状态，不代表上游永久状态。
+            cooldownSec: cooldownRemainingSec(region, a.id),
+            ...(withCredits
+              ? {
+                  credits: c ? c.total : null,
+                  creditError: c ? null : '读取失败',
+                  // 最早过期的积分包（非月付），用于在总览里提示浪费风险。
+                  // 上游 fetchCredits 已经排除了「已用完」和「已过期」的包，
+                  // 所以 null = 没有会过期的积分（只有月付包 / 已用尽）。
+                  nearestExpiry: c?.nearestExpiry ?? null,
+                  expiringSoon: c?.expiringSoon ?? 0,
+                }
+              : {}),
           };
         }),
       });
@@ -1997,12 +2220,18 @@ const server = http.createServer(async (req, res) => {
 
       if (wantStream) {
         // 透传 SSE（上游格式已是标准 OpenAI chunk）
-        res.writeHead(200, {
+        //
+        // 若本来要用 A、结果切到了 B，用响应头告知扩展，让它弹个通知。
+        // ⚠️ 用 header 而不是往 SSE 里塞字段：塞字段要改 stream 解析，
+        //    而且 OpenAI 客户端会看到不认识的 chunk 键（有些会直接报错）。
+        const headers = {
           'content-type': 'text/event-stream; charset=utf-8',
           'cache-control': 'no-cache',
           'connection': 'keep-alive',
           'access-control-allow-origin': '*',
-        });
+          ...failoverHeaders(up),
+        };
+        res.writeHead(200, headers);
         const reader = up.body.getReader();
         let n = 0;
         try {
@@ -2023,7 +2252,7 @@ const server = http.createServer(async (req, res) => {
       // 非流式：聚合成一个 JSON
       const agg = await aggregate(up);
       agg.model = agg.model || body.model;
-      send(res, 200, agg);
+      send(res, 200, agg, failoverHeaders(up));
       log(`✓ 非流式 ${body.model} ${((Date.now() - t0) / 1000).toFixed(1)}s`);
       return;
     }
